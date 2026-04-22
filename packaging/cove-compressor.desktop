@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Cove Compressor
+GenericName=Image & Video Compressor
+Comment=Batch-compress images and videos offline
+Exec=cove-compressor
+Icon=cove-compressor
+Terminal=false
+Categories=AudioVideo;Video;Graphics;Utility;
+Keywords=compress;video;image;ffmpeg;batch;
+StartupNotify=true
