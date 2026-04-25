@@ -6,6 +6,10 @@
 #   - ar, tar, xz, curl
 # Downloads a static ffmpeg+ffprobe build automatically.
 #
+# Env flags:
+#   VERSION=X.Y.Z        set output version (default 2.0.0)
+#   APPIMAGE_ONLY=1      skip the .deb build (faster iteration)
+#
 # Output lands in release/.
 set -euo pipefail
 
@@ -14,7 +18,7 @@ cd "$ROOT"
 
 APP_NAME="cove-compressor"
 DISPLAY_NAME="Cove Compressor"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-2.0.0}"
 ARCH="x86_64"
 DEB_ARCH="amd64"
 RELEASE_DIR="$ROOT/release"
@@ -63,11 +67,21 @@ echo "==> Running PyInstaller"
     --noconfirm --clean --log-level WARN \
     --windowed \
     --name "$APP_NAME" \
-    --add-data "cove_icon.png:." \
+    --paths src \
+    --add-data "src/cove_compressor/assets/cove_icon.png:cove_compressor/assets" \
+    --collect-all pillow_avif \
+    --exclude-module PySide6.QtWebEngineCore \
+    --exclude-module PySide6.QtWebEngineWidgets \
+    --exclude-module PySide6.QtQml \
+    --exclude-module PySide6.QtQuick \
+    --exclude-module PySide6.QtPdf \
+    --exclude-module PySide6.Qt3DCore \
+    --exclude-module PySide6.QtCharts \
+    --exclude-module PySide6.QtDataVisualization \
+    --exclude-module tkinter \
     --add-binary "${FFMPEG_BIN}:." \
     --add-binary "${FFPROBE_BIN}:." \
-    --collect-all pillow_avif \
-    cove_compressor.py
+    packaging/launcher.py
 
 BUNDLE="$DIST_DIR/$APP_NAME"
 [ -d "$BUNDLE" ] || { echo "PyInstaller bundle not found at $BUNDLE"; exit 1; }
@@ -105,6 +119,9 @@ cat > "$APPDIR/AppRun" <<EOF
 #!/usr/bin/env bash
 HERE="\$(dirname "\$(readlink -f "\${0}")")"
 export PATH="\$HERE/usr/bin:\$PATH"
+# Preserve the caller's library path so the app can restore it for
+# external helpers (xdg-open, etc.) that must load host libs.
+export LD_LIBRARY_PATH_ORIG="\${LD_LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH="\$HERE/usr/lib/$APP_NAME:\${LD_LIBRARY_PATH:-}"
 exec "\$HERE/usr/lib/$APP_NAME/$APP_NAME" "\$@"
 EOF
@@ -137,6 +154,15 @@ echo "    -> $APPIMAGE_OUT"
 # ----------------------------------------------------------------------
 # 4. .deb (manual: ar + tar.xz, no dpkg-deb dependency)
 # ----------------------------------------------------------------------
+if [ "${APPIMAGE_ONLY:-0}" = "1" ]; then
+    echo ""
+    echo "APPIMAGE_ONLY=1 set — skipping .deb build."
+    echo ""
+    echo "Release artifacts in $RELEASE_DIR:"
+    ls -lh "$RELEASE_DIR"
+    exit 0
+fi
+
 echo "==> Assembling .deb tree"
 PKG_ROOT="$DEB_BUILD/${APP_NAME}_${VERSION}_${DEB_ARCH}"
 rm -rf "$DEB_BUILD"
@@ -185,8 +211,8 @@ Priority: optional
 Homepage: https://github.com/Sin213/cove-compressor
 Description: Offline batch image & video compressor
  Cove Compressor is a privacy-first desktop tool that batch-compresses
- images (JPEG/PNG/WebP/AVIF) and videos (H.264/H.265) offline. Built with
- PySide6, Pillow, and a bundled ffmpeg — no cloud, no API keys.
+ images (JPEG/PNG/WebP/AVIF) and videos (H.264/H.265/VP9) offline. Built
+ with PySide6, Pillow, and a bundled ffmpeg — no cloud, no API keys.
 EOF
 
 echo "==> Building .deb archive"
