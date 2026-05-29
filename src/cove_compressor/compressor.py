@@ -291,6 +291,12 @@ def compress_image(
     try:
         img = ImageOps.exif_transpose(img)
 
+        # Strip all embedded metadata (EXIF, XMP, ICC profile, etc.) so the
+        # README claim of EXIF removal is actually honoured.  exif_transpose
+        # alone only rotates the image and does not remove metadata.
+        img = img.copy()
+        img.info.clear()
+
         if resize_cap is not None:
             w, h = img.size
             longest = max(w, h)
