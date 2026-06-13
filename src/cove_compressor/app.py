@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__, theme, updater
+from .portable import is_portable, portable_data_dir
 from .compressor import (
     AUDIO_BITRATES, AVIF_AVAILABLE, DEFAULT_OUTPUT,
     FFMPEG_BIN, FFPROBE_BIN, FORMAT_KEY_MAP, FORMAT_OPTIONS,
@@ -656,7 +657,11 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(ICON_PATH)))
         self._resizer = FramelessResizer(self)
 
-        self.settings = QSettings(ORG_NAME, APP_NAME)
+        if is_portable():
+            _portable_dir = portable_data_dir("cove-compressor")
+            self.settings = QSettings(os.path.join(_portable_dir, "settings.ini"), QSettings.IniFormat)
+        else:
+            self.settings = QSettings(ORG_NAME, APP_NAME)
         self.msg_queue: queue.Queue = queue.Queue()
         self.cancel_flag = threading.Event()
         self._last_output_dir: Path | None = None

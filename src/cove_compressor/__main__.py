@@ -2,6 +2,8 @@ import faulthandler
 import os
 import sys
 
+from .portable import is_portable, portable_data_dir
+
 # PyInstaller `--windowed` builds detach from the console, which sets
 # `sys.stderr` to None. `faulthandler.enable()` without args tries to
 # register stderr's fd and raises `RuntimeError: sys.stderr is None`
@@ -15,7 +17,9 @@ if sys.stderr is not None and hasattr(sys.stderr, "fileno"):
         pass
 else:
     try:
-        if sys.platform == "win32":
+        if is_portable():
+            log_dir = os.path.join(portable_data_dir("cove-compressor"), "logs")
+        elif sys.platform == "win32":
             log_dir = os.path.join(
                 os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
                 "CoveCompressor",
