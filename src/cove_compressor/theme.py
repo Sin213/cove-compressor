@@ -16,6 +16,7 @@ PANEL       = "#121a1f"
 PANEL_2     = "#151d23"
 PANEL_HI    = "#192328"
 BORDER      = "#1e2a31"
+WINDOW_EDGE = "rgba(255, 255, 255, 0.18)"  # visible outer border on frameless QMainWindow
 BORDER_HI   = "#27353d"
 TEXT        = "#e6edf0"
 TEXT_2      = "#a2b0b8"
@@ -104,6 +105,9 @@ QWidget {{
 QMainWindow, QDialog {{
     background-color: {BG_2};
 }}
+    QMainWindow {{
+        border: 4px solid {WINDOW_EDGE};
+    }}
 #CovePanel {{
     background: {PANEL};
     border: 1px solid {BORDER};

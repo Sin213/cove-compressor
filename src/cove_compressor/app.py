@@ -37,7 +37,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QSizePolicy, QSpinBox, QStackedWidget,
+    QProgressBar, QPushButton, QSizeGrip, QSizePolicy, QSpinBox, QStackedWidget,
     QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -656,6 +656,11 @@ class MainWindow(QMainWindow):
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
         self._resizer = FramelessResizer(self)
+        # Visible SE-corner resize grip so the user has a discoverable
+        # affordance to grab. FramelessResizer handles invisible edge drag.
+        self._size_grip = QSizeGrip(self)
+        self._size_grip.setFixedSize(16, 16)
+        self._size_grip.raise_()
 
         if is_portable():
             _portable_dir = portable_data_dir("cove-compressor")
@@ -686,6 +691,13 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(4000, self._updater.check)
 
     # ── frameless helpers ──────────────────────────────────────────────
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # Reposition the SE-corner QSizeGrip on every resize so it stays
+        # pinned to the bottom-right of the window.
+        s = self._size_grip.sizeHint()
+        self._size_grip.move(self.width() - s.width(), self.height() - s.height())
 
     def _toggle_maximize(self) -> None:
         if self.isMaximized():
