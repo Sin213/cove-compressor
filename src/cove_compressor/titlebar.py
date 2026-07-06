@@ -210,7 +210,7 @@ class FramelessResizer(QObject):
     `QWindow.startSystemResize()`. Works on X11 / Wayland / Windows without
     any WM-specific glue on our side."""
 
-    BORDER = 6
+    BORDER = 8
 
     def __init__(self, window: QMainWindow) -> None:
         super().__init__(window)
