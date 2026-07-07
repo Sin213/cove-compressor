@@ -17,9 +17,9 @@ Usage from a MainWindow:
     self._updater = updater.UpdateController(
         parent=self,
         current_version=__version__,
-        repo="Sin213/cove-pdf-editor",
-        app_display_name="Cove PDF Editor",
-        cache_subdir="cove-pdf-editor",
+        repo="Sin213/cove-compressor",
+        app_display_name="Cove Compressor",
+        cache_subdir="cove-compressor",
     )
     QTimer.singleShot(4000, self._updater.check)
 """

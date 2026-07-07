@@ -50,9 +50,14 @@ python3 -m venv "$BUILD_ENV"
 echo "==> Fetching ffmpeg static build"
 FF_TMP="$ROOT/build/ff"
 mkdir -p "$FF_TMP"
+# johnvansickle.com intermittently rejects GitHub runner IPs (HTTP 415);
+# fall back to the GitHub-hosted BtbN static build when that happens.
 curl -fL --retry 3 --silent --show-error \
     -o "$FF_TMP/ffmpeg.tar.xz" \
-    "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+    "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
+|| curl -fL --retry 3 --silent --show-error \
+    -o "$FF_TMP/ffmpeg.tar.xz" \
+    "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz"
 (cd "$FF_TMP" && tar -xf ffmpeg.tar.xz)
 FFMPEG_BIN="$(find "$FF_TMP" -type f -name ffmpeg | head -1)"
 FFPROBE_BIN="$(find "$FF_TMP" -type f -name ffprobe | head -1)"
