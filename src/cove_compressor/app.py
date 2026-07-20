@@ -49,7 +49,7 @@ from .compressor import (
     FFMPEG_BIN, FFPROBE_BIN, FORMAT_KEY_MAP, FORMAT_OPTIONS,
     IMAGE_EXTS, IMAGE_PRESETS, RESIZE_CAPS_IMG, RESOLUTION_CAPS,
     VIDEO_EXTS, VIDEO_FORMATS, VIDEO_MODES, VIDEO_QUALITY_PRESETS,
-    any_nvenc_available, compress_image, compress_video,
+    any_amf_available, any_nvenc_available, compress_image, compress_video,
     format_eta, human_size, open_in_file_manager, pct_saved, scan_files,
 )
 from .thumbnails import ThumbnailCache
@@ -1045,8 +1045,9 @@ class MainWindow(QMainWindow):
         self.vid_encoder.addItems(ENCODER_OPTIONS)
         self.vid_encoder.setCurrentText(ENCODER_OPTIONS[0])
         self.vid_encoder.setToolTip(
-            "Automatic uses your NVIDIA GPU (NVENC) when available for much "
-            "faster encoding, and falls back to the CPU otherwise.\n"
+            "Automatic uses your NVIDIA GPU (NVENC) or AMD GPU (AMF) when "
+            "available for much faster encoding, and falls back to the CPU "
+            "otherwise. NVENC is preferred when both are present.\n"
             "Checking for GPU support…")
         v.addWidget(_field("Encoder", self.vid_encoder))
 
@@ -1465,6 +1466,8 @@ class MainWindow(QMainWindow):
                     latest_banner = payload
                 elif kind == "nvenc":
                     self._apply_nvenc_availability(bool(payload))
+                elif kind == "amf":
+                    self._apply_amf_availability(bool(payload))
                 elif kind == "finish":
                     finish = True
         except queue.Empty:
@@ -1503,10 +1506,11 @@ class MainWindow(QMainWindow):
             else:
                 self._log(f"[ERROR] {label} not found on PATH")
 
-        # NVENC needs ffmpeg present to probe; skip the check (and leave the
-        # GPU option disabled) if it isn't.
+        # NVENC and AMF both need ffmpeg present to probe; skip the checks (and
+        # leave the GPU options disabled) if it isn't.
         if not shutil.which(FFMPEG_BIN):
             self.msg_queue.put(("nvenc", False))
+            self.msg_queue.put(("amf", False))
             return
         try:
             nvenc = any_nvenc_available()
@@ -1517,35 +1521,76 @@ class MainWindow(QMainWindow):
                       "— Automatic will use the GPU")
         else:
             self._log("[info] NVENC: no NVIDIA hardware encoder detected "
-                      "— encoding on CPU")
+                      "— Automatic will try AMD AMF next")
+
+        try:
+            amf = any_amf_available()
+        except Exception:  # noqa: BLE001
+            amf = False
+        if amf:
+            self._log("[ok] AMF: AMD hardware encoding available "
+                      f"— Automatic will use the GPU"
+                      f"{' (NVENC preferred)' if nvenc else ''}")
+        else:
+            self._log("[info] AMF: no AMD hardware encoder detected"
+                       + ("" if nvenc else " — encoding on CPU"))
+
         self.msg_queue.put(("nvenc", nvenc))
+        self.msg_queue.put(("amf", amf))
 
     def _apply_nvenc_availability(self, available: bool) -> None:
         """Reflect NVENC detection in the Encoder combo. Runs on the UI thread
         (called from _poll_queue) so it can safely touch widgets."""
+        self._nvenc_available = bool(available)
         nvenc_label = ENCODER_OPTIONS[2]  # "NVIDIA GPU (NVENC)"
         idx = self.vid_encoder.findText(nvenc_label)
-        if idx < 0:
-            return
+        if idx >= 0:
+            # Grey out the force-NVENC choice when no working GPU is present.
+            model = self.vid_encoder.model()
+            item = model.item(idx) if hasattr(model, "item") else None
+            if item is not None:
+                item.setEnabled(available)
+            # A prior session may have saved "NVIDIA GPU (NVENC)"; fall back
+            # to Automatic so the user isn't stuck on a now-disabled choice.
+            if not available and self.vid_encoder.currentIndex() == idx:
+                self.vid_encoder.setCurrentIndex(0)
+        self._refresh_gpu_tooltip()
 
-        # Grey out the force-NVENC choice when no working GPU is present.
-        model = self.vid_encoder.model()
-        item = model.item(idx) if hasattr(model, "item") else None
-        if item is not None:
-            item.setEnabled(available)
+    def _apply_amf_availability(self, available: bool) -> None:
+        """Reflect AMD AMF detection in the Encoder combo. Mirrors the NVENC
+        handler — runs on the UI thread via _poll_queue."""
+        self._amf_available = bool(available)
+        amf_label = ENCODER_OPTIONS[3]  # "AMD GPU (AMF)"
+        idx = self.vid_encoder.findText(amf_label)
+        if idx >= 0:
+            model = self.vid_encoder.model()
+            item = model.item(idx) if hasattr(model, "item") else None
+            if item is not None:
+                item.setEnabled(available)
+            if not available and self.vid_encoder.currentIndex() == idx:
+                self.vid_encoder.setCurrentIndex(0)
+        self._refresh_gpu_tooltip()
 
-        if available:
+    def _refresh_gpu_tooltip(self) -> None:
+        """Rebuild the Encoder combobox tooltip from whichever GPU probes have
+        reported back so far. The placeholders default to False so partial
+        results before both probes finish still render a sane string."""
+        nvenc = getattr(self, "_nvenc_available", False)
+        amf = getattr(self, "_amf_available", False)
+        parts = []
+        if nvenc:
+            parts.append("NVIDIA (NVENC)")
+        if amf:
+            parts.append("AMD (AMF)")
+        if parts:
             self.vid_encoder.setToolTip(
-                "NVIDIA hardware encoding (NVENC) detected — Automatic uses the "
-                "GPU for a large speed-up over CPU encoding.")
+                "Automatic uses " + " and ".join(parts) +
+                " GPU when available for a large speed-up over CPU encoding. "
+                "NVENC is preferred when both are present.")
         else:
             self.vid_encoder.setToolTip(
-                "No NVENC-capable NVIDIA GPU detected on this machine. "
+                "No NVIDIA NVENC or AMD AMF GPU detected on this machine. "
                 "Automatic and CPU both encode on the processor.")
-            # A prior session may have saved "NVIDIA GPU (NVENC)"; fall back to
-            # Automatic so the user isn't stuck on a now-disabled choice.
-            if self.vid_encoder.currentIndex() == idx:
-                self.vid_encoder.setCurrentIndex(0)
 
     # ── input validation ──────────────────────────────────────────────
 
@@ -1799,7 +1844,8 @@ class MainWindow(QMainWindow):
             name = name[:39] + "..."
         if r["status"] == "ok":
             s = pct_saved(r["original"], r["new"])
-            gpu = " · GPU" if str(r.get("encoder", "")).endswith("_nvenc") else ""
+            enc = str(r.get("encoder", ""))
+            gpu = " · GPU" if (enc.endswith("_nvenc") or enc.endswith("_amf")) else ""
             return (f"[ok]    {name:<42s}  "
                     f"{human_size(r['original']):>10s} → {human_size(r['new']):>10s}  "
                     f"({s:5.1f}% saved){gpu}")

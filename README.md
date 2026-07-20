@@ -66,33 +66,42 @@ simplified away.
   *Target reduction* (% smaller, 2-pass)
 - **Output format** — MP4 (H.265), MP4 (H.264), MKV (H.265), WebM (VP9)
 - **Encoder** — Automatic (GPU if available) / CPU (x264 / x265) /
-  NVIDIA GPU (NVENC). See [Hardware acceleration](#hardware-acceleration-nvenc).
+  NVIDIA GPU (NVENC) / AMD GPU (AMF). See
+  [Hardware acceleration](#hardware-acceleration-nvenc--amf).
 - **Resolution cap** — Original / 1080p / 720p / 480p
 - **Audio kbps** — 128 / 192 / 320
 - Quality presets: Web Small / Balanced / Archive Light (CRF values tuned per
-  codec — x265, x264, VP9 — plus matching NVENC `-cq` targets)
+  codec — x265, x264, VP9 — plus matching NVENC `-cq` targets and AMF `-qp`
+  targets)
 
-### Hardware acceleration (NVENC)
+### Hardware acceleration (NVENC / AMF)
 
-On machines with a supported NVIDIA GPU, Cove can offload H.264 / H.265
-encoding to the card's dedicated **NVENC** encoder for a large speed-up over
-the CPU (often several times faster), freeing the processor while a batch runs.
+On machines with a supported GPU, Cove can offload H.264 / H.265 encoding to
+the card's dedicated hardware encoder for a large speed-up over the CPU (often
+several times faster), freeing the processor while a batch runs.
 
-- **Automatic** (default) uses `hevc_nvenc` / `h264_nvenc` whenever a working
-  NVENC encoder is detected, and transparently falls back to the CPU
-  (`libx265` / `libx264`) otherwise. Pick **CPU** to always encode in software,
-  or **NVIDIA GPU (NVENC)** to force it.
-- Detection is a real one-frame test encode run once at launch — the encoder
-  being compiled into `ffmpeg` isn't enough, the GPU + driver have to accept
-  it. When no NVENC-capable GPU is found the *NVIDIA GPU* choice is greyed out.
-- **WebM (VP9)** has no NVENC equivalent, so it always encodes on the CPU
-  regardless of this setting.
-- NVENC handles the *Target file size* / *Target reduction* modes with its own
-  single-pass VBR + internal multipass (a capped-bitrate approximation) rather
-  than the CPU's log-file two-pass; sizes land close to the target but aren't
-  as exact as the software two-pass. Quality presets map to NVENC `-cq` values
-  and the p1–p7 preset scale (`-tune hq`). The log tags GPU-encoded files with
-  `· GPU`.
+- **NVIDIA GPUs** use the card's **NVENC** encoder (`hevc_nvenc` /
+  `h264_nvenc`); **AMD GPUs** use the **AMF** encoder (`hevc_amf` /
+  `h264_amf`). When both are present, NVENC is preferred on Automatic.
+- **Automatic** (default) uses NVENC when a working NVENC encoder is detected,
+  falls back to AMF when NVENC is unavailable but AMF is, and finally falls
+  back to the CPU (`libx265` / `libx264`) otherwise. Pick **CPU** to always
+  encode in software, **NVIDIA GPU (NVENC)** to force NVENC, or
+  **AMD GPU (AMF)** to force AMF.
+- Detection is a real one-frame test encode run once at launch per vendor —
+  the encoder being compiled into `ffmpeg` isn't enough, the GPU + driver have
+  to accept it. When no NVENC-capable GPU is found the *NVIDIA GPU* choice is
+  greyed out; the same applies to AMF and the *AMD GPU* choice.
+- **WebM (VP9)** has no NVENC or AMF equivalent, so it always encodes on the
+  CPU regardless of this setting.
+- Both GPU paths handle the *Target file size* / *Target reduction* modes with
+  their own single-pass VBR (a capped-bitrate approximation) rather than the
+  CPU's log-file two-pass; sizes land close to the target but aren't as exact
+  as the software two-pass. NVENC additionally uses internal `-multipass
+  fullres`; AMF does not. Quality presets map to NVENC `-cq` values on the
+  p1–p7 preset scale (`-tune hq`), and to AMF `-rc cqp -qp` targets with the
+  matching `-quality` dial (`speed` / `balanced` / `quality`) and
+  `-usage transcoding`. The log tags GPU-encoded files with `· GPU`.
 
 ### Action bar
 

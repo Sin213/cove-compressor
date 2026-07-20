@@ -68,16 +68,27 @@ VIDEO_MODES = ["Target file size", "Target reduction", "Quality preset"]
 # little higher for comparable output). `nvenc_preset` is NVENC's p1 (fastest)
 # … p7 (best quality) speed dial — the hardware is fast enough that we can
 # afford the slower, higher-quality presets by default.
+#
+# The `amf_*` values are AMD AMF constant-quality (-qp via -rc cqp) targets on
+# the same 0-51 scale. `amf_quality` is AMF's -quality dial
+# (speed / balanced / quality), mapped 1:1 to the NVENC preset for each Cove
+# preset so users get comparable behavior across vendors.
 VIDEO_QUALITY_PRESETS = {
     "Web Small":     {"x265": 30, "x264": 26, "vp9": 37,
                       "nvenc_hevc": 32, "nvenc_h264": 30,
-                      "speed": "medium", "nvenc_preset": "p5"},
+                      "amf_hevc": 33, "amf_h264": 31,
+                      "speed": "medium", "nvenc_preset": "p5",
+                      "amf_quality": "speed"},
     "Balanced":      {"x265": 25, "x264": 22, "vp9": 31,
                       "nvenc_hevc": 27, "nvenc_h264": 25,
-                      "speed": "medium", "nvenc_preset": "p6"},
+                      "amf_hevc": 28, "amf_h264": 26,
+                      "speed": "medium", "nvenc_preset": "p6",
+                      "amf_quality": "balanced"},
     "Archive Light": {"x265": 22, "x264": 20, "vp9": 27,
                       "nvenc_hevc": 24, "nvenc_h264": 21,
-                      "speed": "slow", "nvenc_preset": "p7"},
+                      "amf_hevc": 25, "amf_h264": 22,
+                      "speed": "slow", "nvenc_preset": "p7",
+                      "amf_quality": "quality"},
 }
 
 # Container/codec presets. libvpx-vp9 is markedly slower than x265 — users
@@ -86,11 +97,17 @@ VIDEO_QUALITY_PRESETS = {
 # `nvenc_codec` / `nvenc_key` name the NVIDIA hardware encoder that can stand
 # in for the software `codec` (H.264 → h264_nvenc, H.265 → hevc_nvenc). VP9
 # has no NVENC equivalent, so WebM stays CPU-only.
+#
+# `amf_codec` / `amf_key` name the AMD AMF hardware encoder that can stand in
+# the same way (H.264 → h264_amf, H.265 → hevc_amf). VP9 likewise has no AMF
+# equivalent. AMF is treated as a fallback for the Automatic path when NVENC
+# isn't available; users can force it explicitly by picking "AMD GPU (AMF)".
 VIDEO_FORMATS = {
     "MP4 (H.265)": {
         "ext": ".mp4", "muxer": "mp4",
         "codec": "libx265", "codec_key": "x265",
         "nvenc_codec": "hevc_nvenc", "nvenc_key": "nvenc_hevc",
+        "amf_codec": "hevc_amf", "amf_key": "amf_hevc",
         "audio": "aac", "container_flags": ["-movflags", "+faststart"],
         "supports_two_pass": True,
     },
@@ -98,6 +115,7 @@ VIDEO_FORMATS = {
         "ext": ".mp4", "muxer": "mp4",
         "codec": "libx264", "codec_key": "x264",
         "nvenc_codec": "h264_nvenc", "nvenc_key": "nvenc_h264",
+        "amf_codec": "h264_amf", "amf_key": "amf_h264",
         "audio": "aac", "container_flags": ["-movflags", "+faststart"],
         "supports_two_pass": True,
     },
@@ -105,6 +123,7 @@ VIDEO_FORMATS = {
         "ext": ".mkv", "muxer": "matroska",
         "codec": "libx265", "codec_key": "x265",
         "nvenc_codec": "hevc_nvenc", "nvenc_key": "nvenc_hevc",
+        "amf_codec": "hevc_amf", "amf_key": "amf_hevc",
         "audio": "aac", "container_flags": [],
         "supports_two_pass": True,
     },
@@ -112,24 +131,28 @@ VIDEO_FORMATS = {
         "ext": ".webm", "muxer": "webm",
         "codec": "libvpx-vp9", "codec_key": "vp9",
         "nvenc_codec": None, "nvenc_key": None,
+        "amf_codec": None, "amf_key": None,
         "audio": "libopus", "container_flags": [],
         "supports_two_pass": True,
     },
 }
 
-# Encoder preference exposed in the UI. "auto" prefers the GPU when a working
-# NVENC encoder is present and falls back to CPU; "cpu" always uses the
-# software encoder; "nvenc" forces the GPU (and still falls back to CPU when
-# the chosen format or machine can't do NVENC, rather than failing the job).
+# Encoder preference exposed in the UI. "auto" prefers an available GPU —
+# NVENC first, then AMF — and falls back to CPU; "cpu" always uses the
+# software encoder; "nvenc" / "amf" force that vendor's GPU (and still fall
+# back to CPU when the chosen format or machine can't drive it, rather than
+# failing the job).
 ENCODER_OPTIONS = [
     "Automatic (GPU if available)",
     "CPU (x264 / x265)",
     "NVIDIA GPU (NVENC)",
+    "AMD GPU (AMF)",
 ]
 ENCODER_KEY_MAP = {
     "Automatic (GPU if available)": "auto",
     "CPU (x264 / x265)":            "cpu",
     "NVIDIA GPU (NVENC)":           "nvenc",
+    "AMD GPU (AMF)":                "amf",
 }
 
 RESOLUTION_CAPS = {
@@ -230,6 +253,59 @@ def nvenc_available(encoder: str = "hevc_nvenc") -> bool:
 def any_nvenc_available() -> bool:
     """True if either NVENC encoder Cove can use (H.265 or H.264) works here."""
     return nvenc_available("hevc_nvenc") or nvenc_available("h264_nvenc")
+
+
+# ── AMF (AMD hardware encoding) detection ────────────────────────────────────
+#
+# Same reasoning as NVENC: AMF encoders can be compiled into ffmpeg yet fail
+# to initialize with no AMD GPU / driver present. Probe once per encoder and
+# cache the verdict. AMF is only available on Windows and Linux, and the
+# bundled builds (gyan.dev on Windows, johnvansickle.com on Linux) ship with
+# AMF support compiled in; the probe is what tells us the rest.
+
+_AMF_LOCK = threading.Lock()
+_amf_cache: dict[str, bool] = {}
+
+
+def _probe_amf(encoder: str) -> bool:
+    """Return True only if `encoder` is both present in this ffmpeg build and
+    can actually initialize on this machine (working AMD GPU + driver)."""
+    try:
+        listing = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=15, **SUBPROCESS_FLAGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if encoder not in (listing.stdout or ""):
+        return False
+
+    try:
+        probe = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=c=black:s=320x240:r=10:d=0.3",
+             "-c:v", encoder, "-f", "null", os.devnull],
+            capture_output=True, text=True, timeout=30, **SUBPROCESS_FLAGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def amf_available(encoder: str = "hevc_amf") -> bool:
+    """Cached: can this machine encode with the given AMF encoder?"""
+    with _AMF_LOCK:
+        if encoder in _amf_cache:
+            return _amf_cache[encoder]
+    result = _probe_amf(encoder)
+    with _AMF_LOCK:
+        _amf_cache[encoder] = result
+    return result
+
+
+def any_amf_available() -> bool:
+    """True if either AMF encoder Cove can use (H.265 or H.264) works here."""
+    return amf_available("hevc_amf") or amf_available("h264_amf")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -525,12 +601,13 @@ def build_video_encoder_args(
     crf: int | None,
     speed_preset: str,
     nvenc_preset: str,
+    amf_quality: str = "balanced",
 ) -> list:
     """Build the video-encoder portion of an ffmpeg command for one pass.
 
     Kept module-level (rather than closed over `compress_video`'s locals) so
-    the codec × rate-control matrix — including the NVENC hardware path — is
-    unit-testable without spawning ffmpeg.
+    the codec × rate-control matrix — including the NVENC and AMF hardware
+    paths — is unit-testable without spawning ffmpeg.
 
     Rate control:
       • CPU bitrate target → ABR, optionally as a log-file two-pass.
@@ -539,14 +616,24 @@ def build_video_encoder_args(
                              invocation `-multipass fullres` (never the log-file
                              two-pass, which NVENC doesn't use).
       • NVENC quality      → VBR constant-quality via -cq with -b:v 0.
+      • AMF bitrate        → VBR with the same capped-maxrate heuristic; AMF
+                             has no `-multipass`, so size targeting is a
+                             single-pass approximation like NVENC's.
+      • AMF quality        → constant-quality via -rc cqp -qp on the 0-51 scale.
     """
     is_nvenc = encoder.endswith("_nvenc")
+    is_amf = encoder.endswith("_amf")
     a = ["-c:v", encoder]
 
     if is_nvenc:
         # NVENC presets run p1 (fastest) … p7 (best quality); -tune hq biases
         # the encoder toward quality rather than low-latency streaming.
         a += ["-preset", nvenc_preset, "-tune", "hq"]
+    elif is_amf:
+        # AMF's -quality dial runs speed → balanced → quality (best). -usage
+        # transcoding is the right mode for offline file compression (vs. the
+        # low-latency / ultralowlatency modes meant for live streaming).
+        a += ["-quality", amf_quality, "-usage", "transcoding"]
     elif encoder in ("libx264", "libx265"):
         a += ["-preset", speed_preset]
     elif encoder == "libvpx-vp9":
@@ -558,8 +645,8 @@ def build_video_encoder_args(
         a += ["-vf", vf]
 
     if use_two_pass:
-        # CPU ABR two-pass. NVENC never reaches this branch — it does its own
-        # internal multipass in the single-pass bitrate case below.
+        # CPU ABR two-pass. NVENC and AMF never reach this branch — they do
+        # their own single-pass bitrate handling below.
         a += ["-b:v", f"{video_kbps}k"]
         if pass_num:
             a += ["-pass", str(pass_num)]
@@ -569,11 +656,20 @@ def build_video_encoder_args(
                   "-maxrate", f"{int(video_kbps * 1.4)}k",
                   "-bufsize", f"{int(video_kbps * 2)}k",
                   "-multipass", "fullres"]
+        elif is_amf:
+            # AMF has no equivalent of NVENC's -multipass fullres; sizes land
+            # close to target but aren't as exact as the software two-pass.
+            a += ["-rc", "vbr", "-b:v", f"{video_kbps}k",
+                  "-maxrate", f"{int(video_kbps * 1.4)}k",
+                  "-bufsize", f"{int(video_kbps * 2)}k"]
         else:
             a += ["-b:v", f"{video_kbps}k"]
     else:
         if is_nvenc:
             a += ["-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
+        elif is_amf:
+            # AMF constant-quality uses cqp + -qp on the same 0-51 scale.
+            a += ["-rc", "cqp", "-qp", str(crf)]
         else:
             a += ["-crf", str(crf)]
             if encoder == "libvpx-vp9":
@@ -605,19 +701,31 @@ def compress_video(
     container_flags = fmt["container_flags"]
     two_pass_ok     = fmt["supports_two_pass"]
 
-    # Prefer the NVIDIA hardware encoder when the user allows it, the format
-    # has a hardware equivalent, and NVENC actually works on this machine.
-    # Forcing NVENC on an unsupported format (e.g. WebM/VP9) or an NVENC-less
-    # box quietly falls back to CPU rather than failing the whole job.
+    # Prefer a hardware encoder when the user allows it, the format has a
+    # hardware equivalent, and the encoder actually initializes on this
+    # machine. NVENC wins when both vendors are reachable and the user is on
+    # Automatic; AMF is the fallback. Forcing a vendor on an unsupported
+    # format (e.g. WebM/VP9) or a machine without that GPU quietly falls back
+    # to CPU rather than failing the whole job.
     nvenc_codec = fmt.get("nvenc_codec")
+    amf_codec = fmt.get("amf_codec")
     use_nvenc = bool(
         nvenc_codec
         and encoder_pref in ("auto", "nvenc")
         and nvenc_available(nvenc_codec)
     )
+    use_amf = bool(
+        amf_codec
+        and encoder_pref in ("auto", "amf")
+        and amf_available(amf_codec)
+        and not use_nvenc
+    )
     if use_nvenc:
         encoder    = nvenc_codec
         quality_key = fmt["nvenc_key"]
+    elif use_amf:
+        encoder    = amf_codec
+        quality_key = fmt["amf_key"]
     else:
         quality_key = codec_key
 
@@ -632,6 +740,7 @@ def compress_video(
     crf = None
     speed_preset = "medium"
     nvenc_preset = "p6"
+    amf_quality = "balanced"
 
     if mode in ("Target file size", "Target reduction"):
         if not duration or duration <= 0:
@@ -650,14 +759,15 @@ def compress_video(
                     "msg": "target size >= original; nothing to do"}
 
         video_kbps = calc_video_bitrate_kbps(target_bytes, duration, int(audio_kbps))
-        # NVENC does its own single-invocation multipass, so it never uses the
-        # log-file two-pass ABR path.
-        use_two_pass = two_pass_ok and not use_nvenc
+        # NVENC and AMF each do their own single-invocation rate control, so
+        # neither uses the log-file two-pass ABR path the software encoders do.
+        use_two_pass = two_pass_ok and not use_nvenc and not use_amf
     else:
         p = VIDEO_QUALITY_PRESETS[str(mode_value)]
         crf = p[quality_key]
         speed_preset = p["speed"]
         nvenc_preset = p["nvenc_preset"]
+        amf_quality = p["amf_quality"]
 
     vf = build_scale_filter(resolution_cap) if resolution_cap else None
     ffmpeg_base = [FFMPEG_BIN, "-nostdin", "-hide_banner", "-y"]
@@ -668,6 +778,7 @@ def compress_video(
             encoder=encoder, vf=vf, use_two_pass=use_two_pass,
             pass_num=pass_num, video_kbps=video_kbps, crf=crf,
             speed_preset=speed_preset, nvenc_preset=nvenc_preset,
+            amf_quality=amf_quality,
         )
 
     def _make_progress(offset: float, scale: float, label: str):
@@ -709,7 +820,8 @@ def compress_video(
                 cancel_flag,
                 duration=duration,
                 on_progress=_make_progress(
-                    0, 100, "encoding · GPU" if use_nvenc else "encoding"))
+                    0, 100,
+                    "encoding · GPU" if (use_nvenc or use_amf) else "encoding"))
 
     if rc == -2:
         if tmp_path.exists():
