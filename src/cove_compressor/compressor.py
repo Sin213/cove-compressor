@@ -62,40 +62,74 @@ FORMAT_KEY_MAP = {
 
 VIDEO_MODES = ["Target file size", "Target reduction", "Quality preset"]
 
-# Per-codec CRF values per quality preset.
+# Per-codec quality values per preset. CRF for the software encoders; the
+# `nvenc_*` values are NVENC constant-quality (-cq) targets on the same 0-51
+# scale (NVENC is less bit-efficient than x264/x265, so the numbers sit a
+# little higher for comparable output). `nvenc_preset` is NVENC's p1 (fastest)
+# … p7 (best quality) speed dial — the hardware is fast enough that we can
+# afford the slower, higher-quality presets by default.
 VIDEO_QUALITY_PRESETS = {
-    "Web Small":     {"x265": 30, "x264": 26, "vp9": 37, "speed": "medium"},
-    "Balanced":      {"x265": 25, "x264": 22, "vp9": 31, "speed": "medium"},
-    "Archive Light": {"x265": 22, "x264": 20, "vp9": 27, "speed": "slow"},
+    "Web Small":     {"x265": 30, "x264": 26, "vp9": 37,
+                      "nvenc_hevc": 32, "nvenc_h264": 30,
+                      "speed": "medium", "nvenc_preset": "p5"},
+    "Balanced":      {"x265": 25, "x264": 22, "vp9": 31,
+                      "nvenc_hevc": 27, "nvenc_h264": 25,
+                      "speed": "medium", "nvenc_preset": "p6"},
+    "Archive Light": {"x265": 22, "x264": 20, "vp9": 27,
+                      "nvenc_hevc": 24, "nvenc_h264": 21,
+                      "speed": "slow", "nvenc_preset": "p7"},
 }
 
 # Container/codec presets. libvpx-vp9 is markedly slower than x265 — users
 # opt into that tradeoff by picking WebM.
+#
+# `nvenc_codec` / `nvenc_key` name the NVIDIA hardware encoder that can stand
+# in for the software `codec` (H.264 → h264_nvenc, H.265 → hevc_nvenc). VP9
+# has no NVENC equivalent, so WebM stays CPU-only.
 VIDEO_FORMATS = {
     "MP4 (H.265)": {
         "ext": ".mp4", "muxer": "mp4",
         "codec": "libx265", "codec_key": "x265",
+        "nvenc_codec": "hevc_nvenc", "nvenc_key": "nvenc_hevc",
         "audio": "aac", "container_flags": ["-movflags", "+faststart"],
         "supports_two_pass": True,
     },
     "MP4 (H.264)": {
         "ext": ".mp4", "muxer": "mp4",
         "codec": "libx264", "codec_key": "x264",
+        "nvenc_codec": "h264_nvenc", "nvenc_key": "nvenc_h264",
         "audio": "aac", "container_flags": ["-movflags", "+faststart"],
         "supports_two_pass": True,
     },
     "MKV (H.265)": {
         "ext": ".mkv", "muxer": "matroska",
         "codec": "libx265", "codec_key": "x265",
+        "nvenc_codec": "hevc_nvenc", "nvenc_key": "nvenc_hevc",
         "audio": "aac", "container_flags": [],
         "supports_two_pass": True,
     },
     "WebM (VP9)": {
         "ext": ".webm", "muxer": "webm",
         "codec": "libvpx-vp9", "codec_key": "vp9",
+        "nvenc_codec": None, "nvenc_key": None,
         "audio": "libopus", "container_flags": [],
         "supports_two_pass": True,
     },
+}
+
+# Encoder preference exposed in the UI. "auto" prefers the GPU when a working
+# NVENC encoder is present and falls back to CPU; "cpu" always uses the
+# software encoder; "nvenc" forces the GPU (and still falls back to CPU when
+# the chosen format or machine can't do NVENC, rather than failing the job).
+ENCODER_OPTIONS = [
+    "Automatic (GPU if available)",
+    "CPU (x264 / x265)",
+    "NVIDIA GPU (NVENC)",
+]
+ENCODER_KEY_MAP = {
+    "Automatic (GPU if available)": "auto",
+    "CPU (x264 / x265)":            "cpu",
+    "NVIDIA GPU (NVENC)":           "nvenc",
 }
 
 RESOLUTION_CAPS = {
@@ -140,6 +174,62 @@ def _resolve_binary(name: str) -> str:
 
 FFMPEG_BIN  = _resolve_binary("ffmpeg")
 FFPROBE_BIN = _resolve_binary("ffprobe")
+
+
+# ── NVENC (NVIDIA hardware encoding) detection ────────────────────────────────
+#
+# Whether NVENC works is a runtime property of the machine, not just the
+# ffmpeg build: the encoders can be compiled in yet fail to initialize with no
+# NVIDIA GPU / driver present. So we do a real 1-frame null encode and cache
+# the verdict per encoder. The probe is cheap but not free, so callers should
+# rely on the cache (warmed once at startup) rather than re-probing per file.
+
+_NVENC_LOCK = threading.Lock()
+_nvenc_cache: dict[str, bool] = {}
+
+
+def _probe_nvenc(encoder: str) -> bool:
+    """Return True only if `encoder` is both present in this ffmpeg build and
+    can actually initialize on this machine (working NVIDIA GPU + driver)."""
+    try:
+        listing = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=15, **SUBPROCESS_FLAGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if encoder not in (listing.stdout or ""):
+        return False
+
+    # Compiled in — now confirm the hardware actually accepts it. A tiny
+    # synthetic clip encoded to the null muxer exercises NVENC init without
+    # touching disk or the user's files.
+    try:
+        probe = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=c=black:s=320x240:r=10:d=0.3",
+             "-c:v", encoder, "-f", "null", os.devnull],
+            capture_output=True, text=True, timeout=30, **SUBPROCESS_FLAGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def nvenc_available(encoder: str = "hevc_nvenc") -> bool:
+    """Cached: can this machine encode with the given NVENC encoder?"""
+    with _NVENC_LOCK:
+        if encoder in _nvenc_cache:
+            return _nvenc_cache[encoder]
+    result = _probe_nvenc(encoder)
+    with _NVENC_LOCK:
+        _nvenc_cache[encoder] = result
+    return result
+
+
+def any_nvenc_available() -> bool:
+    """True if either NVENC encoder Cove can use (H.265 or H.264) works here."""
+    return nvenc_available("hevc_nvenc") or nvenc_available("h264_nvenc")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -426,6 +516,74 @@ def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
     return proc.returncode, "\n".join(tail)
 
 
+def build_video_encoder_args(
+    encoder: str,
+    vf: str | None,
+    use_two_pass: bool,
+    pass_num: int | None,
+    video_kbps: int | None,
+    crf: int | None,
+    speed_preset: str,
+    nvenc_preset: str,
+) -> list:
+    """Build the video-encoder portion of an ffmpeg command for one pass.
+
+    Kept module-level (rather than closed over `compress_video`'s locals) so
+    the codec × rate-control matrix — including the NVENC hardware path — is
+    unit-testable without spawning ffmpeg.
+
+    Rate control:
+      • CPU bitrate target → ABR, optionally as a log-file two-pass.
+      • CPU quality        → -crf (plus -b:v 0 for VP9's constant-quality mode).
+      • NVENC bitrate      → VBR with a capped maxrate and NVENC's own single-
+                             invocation `-multipass fullres` (never the log-file
+                             two-pass, which NVENC doesn't use).
+      • NVENC quality      → VBR constant-quality via -cq with -b:v 0.
+    """
+    is_nvenc = encoder.endswith("_nvenc")
+    a = ["-c:v", encoder]
+
+    if is_nvenc:
+        # NVENC presets run p1 (fastest) … p7 (best quality); -tune hq biases
+        # the encoder toward quality rather than low-latency streaming.
+        a += ["-preset", nvenc_preset, "-tune", "hq"]
+    elif encoder in ("libx264", "libx265"):
+        a += ["-preset", speed_preset]
+    elif encoder == "libvpx-vp9":
+        # libvpx-vp9 is slow. row-mt + cpu-used 4 keeps quality reasonable
+        # without taking forever.
+        a += ["-row-mt", "1", "-cpu-used", "4"]
+
+    if vf:
+        a += ["-vf", vf]
+
+    if use_two_pass:
+        # CPU ABR two-pass. NVENC never reaches this branch — it does its own
+        # internal multipass in the single-pass bitrate case below.
+        a += ["-b:v", f"{video_kbps}k"]
+        if pass_num:
+            a += ["-pass", str(pass_num)]
+    elif video_kbps is not None:
+        if is_nvenc:
+            a += ["-rc", "vbr", "-b:v", f"{video_kbps}k",
+                  "-maxrate", f"{int(video_kbps * 1.4)}k",
+                  "-bufsize", f"{int(video_kbps * 2)}k",
+                  "-multipass", "fullres"]
+        else:
+            a += ["-b:v", f"{video_kbps}k"]
+    else:
+        if is_nvenc:
+            a += ["-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
+        else:
+            a += ["-crf", str(crf)]
+            if encoder == "libvpx-vp9":
+                a += ["-b:v", "0"]
+
+    if encoder == "libx265":
+        a += ["-x265-params", "log-level=error"]
+    return a
+
+
 def compress_video(
     input_path: Path,
     output_dir: Path,
@@ -436,6 +594,7 @@ def compress_video(
     audio_kbps: str,
     cancel_flag: threading.Event,
     progress_cb=None,
+    encoder_pref: str = "auto",
 ) -> dict:
     fmt = VIDEO_FORMATS[video_format_key]
     encoder    = fmt["codec"]
@@ -445,6 +604,22 @@ def compress_video(
     muxer      = fmt["muxer"]
     container_flags = fmt["container_flags"]
     two_pass_ok     = fmt["supports_two_pass"]
+
+    # Prefer the NVIDIA hardware encoder when the user allows it, the format
+    # has a hardware equivalent, and NVENC actually works on this machine.
+    # Forcing NVENC on an unsupported format (e.g. WebM/VP9) or an NVENC-less
+    # box quietly falls back to CPU rather than failing the whole job.
+    nvenc_codec = fmt.get("nvenc_codec")
+    use_nvenc = bool(
+        nvenc_codec
+        and encoder_pref in ("auto", "nvenc")
+        and nvenc_available(nvenc_codec)
+    )
+    if use_nvenc:
+        encoder    = nvenc_codec
+        quality_key = fmt["nvenc_key"]
+    else:
+        quality_key = codec_key
 
     original_size = input_path.stat().st_size
     output_path = unique_path(output_dir / f"{input_path.stem}{out_ext}")
@@ -456,6 +631,7 @@ def compress_video(
     video_kbps = None
     crf = None
     speed_preset = "medium"
+    nvenc_preset = "p6"
 
     if mode in ("Target file size", "Target reduction"):
         if not duration or duration <= 0:
@@ -474,39 +650,25 @@ def compress_video(
                     "msg": "target size >= original; nothing to do"}
 
         video_kbps = calc_video_bitrate_kbps(target_bytes, duration, int(audio_kbps))
-        use_two_pass = two_pass_ok
+        # NVENC does its own single-invocation multipass, so it never uses the
+        # log-file two-pass ABR path.
+        use_two_pass = two_pass_ok and not use_nvenc
     else:
         p = VIDEO_QUALITY_PRESETS[str(mode_value)]
-        crf = p[codec_key]
+        crf = p[quality_key]
         speed_preset = p["speed"]
+        nvenc_preset = p["nvenc_preset"]
 
     vf = build_scale_filter(resolution_cap) if resolution_cap else None
     ffmpeg_base = [FFMPEG_BIN, "-nostdin", "-hide_banner", "-y"]
     common_in = ["-i", str(input_path)]
 
     def vargs(pass_num):
-        a = ["-c:v", encoder]
-        if encoder in ("libx264", "libx265"):
-            a += ["-preset", speed_preset]
-        elif encoder == "libvpx-vp9":
-            # libvpx-vp9 is slow. row-mt + cpu-used 4 keeps quality reasonable
-            # without taking forever.
-            a += ["-row-mt", "1", "-cpu-used", "4"]
-        if vf:
-            a += ["-vf", vf]
-        if use_two_pass:
-            a += ["-b:v", f"{video_kbps}k"]
-            if pass_num:
-                a += ["-pass", str(pass_num)]
-        elif video_kbps is not None:
-            a += ["-b:v", f"{video_kbps}k"]
-        else:
-            a += ["-crf", str(crf)]
-            if encoder == "libvpx-vp9":
-                a += ["-b:v", "0"]
-        if encoder == "libx265":
-            a += ["-x265-params", "log-level=error"]
-        return a
+        return build_video_encoder_args(
+            encoder=encoder, vf=vf, use_two_pass=use_two_pass,
+            pass_num=pass_num, video_kbps=video_kbps, crf=crf,
+            speed_preset=speed_preset, nvenc_preset=nvenc_preset,
+        )
 
     def _make_progress(offset: float, scale: float, label: str):
         if not progress_cb:
@@ -546,7 +708,8 @@ def compress_video(
                 ] + container_flags + ["-f", muxer, str(tmp_path)],
                 cancel_flag,
                 duration=duration,
-                on_progress=_make_progress(0, 100, "encoding"))
+                on_progress=_make_progress(
+                    0, 100, "encoding · GPU" if use_nvenc else "encoding"))
 
     if rc == -2:
         if tmp_path.exists():
@@ -568,4 +731,4 @@ def compress_video(
 
     tmp_path.rename(output_path)
     return {"file": input_path, "output": output_path, "status": "ok",
-            "original": original_size, "new": new_size}
+            "original": original_size, "new": new_size, "encoder": encoder}

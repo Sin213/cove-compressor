@@ -45,10 +45,11 @@ from . import __version__, theme, updater
 from .portable import is_portable, portable_data_dir
 from .compressor import (
     AUDIO_BITRATES, AVIF_AVAILABLE, DEFAULT_OUTPUT,
+    ENCODER_KEY_MAP, ENCODER_OPTIONS,
     FFMPEG_BIN, FFPROBE_BIN, FORMAT_KEY_MAP, FORMAT_OPTIONS,
     IMAGE_EXTS, IMAGE_PRESETS, RESIZE_CAPS_IMG, RESOLUTION_CAPS,
     VIDEO_EXTS, VIDEO_FORMATS, VIDEO_MODES, VIDEO_QUALITY_PRESETS,
-    compress_image, compress_video,
+    any_nvenc_available, compress_image, compress_video,
     format_eta, human_size, open_in_file_manager, pct_saved, scan_files,
 )
 from .thumbnails import ThumbnailCache
@@ -1040,6 +1041,15 @@ class MainWindow(QMainWindow):
         self.vid_format.setCurrentText("MP4 (H.265)")
         v.addWidget(_field("Output format", self.vid_format))
 
+        self.vid_encoder = QComboBox()
+        self.vid_encoder.addItems(ENCODER_OPTIONS)
+        self.vid_encoder.setCurrentText(ENCODER_OPTIONS[0])
+        self.vid_encoder.setToolTip(
+            "Automatic uses your NVIDIA GPU (NVENC) when available for much "
+            "faster encoding, and falls back to the CPU otherwise.\n"
+            "Checking for GPU support…")
+        v.addWidget(_field("Encoder", self.vid_encoder))
+
         self.vid_res = QComboBox()
         self.vid_res.addItems(list(RESOLUTION_CAPS.keys()))
         v.addWidget(_field("Resolution cap", self.vid_res))
@@ -1375,6 +1385,7 @@ class MainWindow(QMainWindow):
         _set_combo(self.img_resize,  "img/resize")
 
         _set_combo(self.vid_format,  "vid/format")
+        _set_combo(self.vid_encoder, "vid/encoder")
         _set_combo(self.vid_mode,    "vid/mode")
         _set_combo(self.vid_quality, "vid/quality")
         _set_combo(self.vid_res,     "vid/res")
@@ -1402,6 +1413,7 @@ class MainWindow(QMainWindow):
         s.setValue("img/format",      self.img_format.currentText())
         s.setValue("img/resize",      self.img_resize.currentText())
         s.setValue("vid/format",      self.vid_format.currentText())
+        s.setValue("vid/encoder",     self.vid_encoder.currentText())
         s.setValue("vid/mode",        self.vid_mode.currentText())
         s.setValue("vid/quality",     self.vid_quality.currentText())
         s.setValue("vid/res",         self.vid_res.currentText())
@@ -1451,6 +1463,8 @@ class MainWindow(QMainWindow):
                     latest_eta = payload
                 elif kind == "banner":
                     latest_banner = payload
+                elif kind == "nvenc":
+                    self._apply_nvenc_availability(bool(payload))
                 elif kind == "finish":
                     finish = True
         except queue.Empty:
@@ -1488,6 +1502,50 @@ class MainWindow(QMainWindow):
                 self._log(f"[ok] {label}: {path}")
             else:
                 self._log(f"[ERROR] {label} not found on PATH")
+
+        # NVENC needs ffmpeg present to probe; skip the check (and leave the
+        # GPU option disabled) if it isn't.
+        if not shutil.which(FFMPEG_BIN):
+            self.msg_queue.put(("nvenc", False))
+            return
+        try:
+            nvenc = any_nvenc_available()
+        except Exception:  # noqa: BLE001
+            nvenc = False
+        if nvenc:
+            self._log("[ok] NVENC: NVIDIA hardware encoding available "
+                      "— Automatic will use the GPU")
+        else:
+            self._log("[info] NVENC: no NVIDIA hardware encoder detected "
+                      "— encoding on CPU")
+        self.msg_queue.put(("nvenc", nvenc))
+
+    def _apply_nvenc_availability(self, available: bool) -> None:
+        """Reflect NVENC detection in the Encoder combo. Runs on the UI thread
+        (called from _poll_queue) so it can safely touch widgets."""
+        nvenc_label = ENCODER_OPTIONS[2]  # "NVIDIA GPU (NVENC)"
+        idx = self.vid_encoder.findText(nvenc_label)
+        if idx < 0:
+            return
+
+        # Grey out the force-NVENC choice when no working GPU is present.
+        model = self.vid_encoder.model()
+        item = model.item(idx) if hasattr(model, "item") else None
+        if item is not None:
+            item.setEnabled(available)
+
+        if available:
+            self.vid_encoder.setToolTip(
+                "NVIDIA hardware encoding (NVENC) detected — Automatic uses the "
+                "GPU for a large speed-up over CPU encoding.")
+        else:
+            self.vid_encoder.setToolTip(
+                "No NVENC-capable NVIDIA GPU detected on this machine. "
+                "Automatic and CPU both encode on the processor.")
+            # A prior session may have saved "NVIDIA GPU (NVENC)"; fall back to
+            # Automatic so the user isn't stuck on a now-disabled choice.
+            if self.vid_encoder.currentIndex() == idx:
+                self.vid_encoder.setCurrentIndex(0)
 
     # ── input validation ──────────────────────────────────────────────
 
@@ -1600,9 +1658,10 @@ class MainWindow(QMainWindow):
         else:
             mode_value = self.vid_quality.currentText()
 
-        vid_format = self.vid_format.currentText()
-        res_cap    = RESOLUTION_CAPS[self.vid_res.currentText()]
-        audio      = self.vid_audio.currentText()
+        vid_format   = self.vid_format.currentText()
+        res_cap      = RESOLUTION_CAPS[self.vid_res.currentText()]
+        audio        = self.vid_audio.currentText()
+        encoder_pref = ENCODER_KEY_MAP[self.vid_encoder.currentText()]
 
         self.banner.hide()
         self._last_output_dir = output_dir
@@ -1611,11 +1670,13 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self._set_eta("")
         self._log(f"=== Videos • {mode} ({mode_value}) • {vid_format} • "
+                  f"{self.vid_encoder.currentText()} • "
                   f"{len(files)} file(s) • {datetime.now().strftime('%H:%M:%S')} ===")
 
         threading.Thread(
             target=self._run_video_batch,
-            args=(files, output_dir, mode, mode_value, vid_format, res_cap, audio),
+            args=(files, output_dir, mode, mode_value, vid_format, res_cap,
+                  audio, encoder_pref),
             daemon=True,
         ).start()
 
@@ -1678,7 +1739,7 @@ class MainWindow(QMainWindow):
         self._finish()
 
     def _run_video_batch(self, files, output_dir, mode, mode_value,
-                         vid_format, res_cap, audio):
+                         vid_format, res_cap, audio, encoder_pref="auto"):
         total = len(files)
         total_orig = total_new = 0
         ok = skipped = errors = 0
@@ -1712,6 +1773,7 @@ class MainWindow(QMainWindow):
                 res_cap, audio,
                 self.cancel_flag,
                 progress_cb=on_progress,
+                encoder_pref=encoder_pref,
             )
             self._log(self._fmt(result))
             if result["status"] == "ok":
@@ -1737,9 +1799,10 @@ class MainWindow(QMainWindow):
             name = name[:39] + "..."
         if r["status"] == "ok":
             s = pct_saved(r["original"], r["new"])
+            gpu = " · GPU" if str(r.get("encoder", "")).endswith("_nvenc") else ""
             return (f"[ok]    {name:<42s}  "
                     f"{human_size(r['original']):>10s} → {human_size(r['new']):>10s}  "
-                    f"({s:5.1f}% saved)")
+                    f"({s:5.1f}% saved){gpu}")
         if r["status"] == "skipped":
             return f"[skip]  {name:<42s}  {r.get('msg', 'skipped')}"
         return     f"[err]   {name:<42s}  {r.get('msg', 'error')}"

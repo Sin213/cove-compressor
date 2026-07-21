@@ -65,14 +65,39 @@ simplified away.
 - **Method** — *Quality preset* (CRF), *Target file size* (MB, 2-pass), or
   *Target reduction* (% smaller, 2-pass)
 - **Output format** — MP4 (H.265), MP4 (H.264), MKV (H.265), WebM (VP9)
+- **Encoder** — Automatic (GPU if available) / CPU (x264 / x265) /
+  NVIDIA GPU (NVENC). See [Hardware acceleration](#hardware-acceleration-nvenc).
 - **Resolution cap** — Original / 1080p / 720p / 480p
 - **Audio kbps** — 128 / 192 / 320
 - Quality presets: Web Small / Balanced / Archive Light (CRF values tuned per
-  codec — x265, x264, VP9)
+  codec — x265, x264, VP9 — plus matching NVENC `-cq` targets)
+
+### Hardware acceleration (NVENC)
+
+On machines with a supported NVIDIA GPU, Cove can offload H.264 / H.265
+encoding to the card's dedicated **NVENC** encoder for a large speed-up over
+the CPU (often several times faster), freeing the processor while a batch runs.
+
+- **Automatic** (default) uses `hevc_nvenc` / `h264_nvenc` whenever a working
+  NVENC encoder is detected, and transparently falls back to the CPU
+  (`libx265` / `libx264`) otherwise. Pick **CPU** to always encode in software,
+  or **NVIDIA GPU (NVENC)** to force it.
+- Detection is a real one-frame test encode run once at launch — the encoder
+  being compiled into `ffmpeg` isn't enough, the GPU + driver have to accept
+  it. When no NVENC-capable GPU is found the *NVIDIA GPU* choice is greyed out.
+- **WebM (VP9)** has no NVENC equivalent, so it always encodes on the CPU
+  regardless of this setting.
+- NVENC handles the *Target file size* / *Target reduction* modes with its own
+  single-pass VBR + internal multipass (a capped-bitrate approximation) rather
+  than the CPU's log-file two-pass; sizes land close to the target but aren't
+  as exact as the software two-pass. Quality presets map to NVENC `-cq` values
+  and the p1–p7 preset scale (`-tune hq`). The log tags GPU-encoded files with
+  `· GPU`.
 
 ### Action bar
 
-- **Status line** — current file + stage (`pass 1/2`, `pass 2/2`, `encoding`)
+- **Status line** — current file + stage (`pass 1/2`, `pass 2/2`, `encoding`,
+  `encoding · GPU` when NVENC is in use)
 - **Mint-glow progress bar** with live ETA
 - **Start / Cancel** swap in place — mid-batch cancellation terminates the
   running ffmpeg cleanly
@@ -95,9 +120,9 @@ don't poison the child process).
 
 ### Other polish
 
-- **Persistent settings** — last-used preset, format, resize cap, video method
-  values, audio bitrate, resolution cap, output folder, log visibility, last
-  tab, and window geometry all survive restarts via `QSettings`
+- **Persistent settings** — last-used preset, format, encoder, resize cap,
+  video method values, audio bitrate, resolution cap, output folder, log
+  visibility, last tab, and window geometry all survive restarts via `QSettings`
   (`~/.config/Cove/Cove Compressor.conf` on Linux,
    `HKCU\Software\Cove\Cove Compressor` on Windows).
 - **Auto-updater** — on launch a background thread checks GitHub Releases; when
@@ -262,6 +287,7 @@ build.ps1              # Windows Setup.exe + Portable.exe builder
 | Videos | Method            | Quality preset       |
 | Videos | Preset            | Balanced             |
 | Videos | Output format     | MP4 (H.265)          |
+| Videos | Encoder           | Automatic (GPU if available) |
 | Videos | Resolution cap    | Original             |
 | Videos | Audio bitrate     | 192 kbps             |
 | —      | Output folder     | `~/Downloads/cove-compressed` |
