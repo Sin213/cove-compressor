@@ -53,7 +53,9 @@ class ConfigConsistencyTest(unittest.TestCase):
 
     def test_encoder_key_map_covers_all_options(self):
         self.assertEqual(set(ENCODER_KEY_MAP), set(ENCODER_OPTIONS))
-        self.assertEqual(set(ENCODER_KEY_MAP.values()), {"auto", "cpu", "nvenc"})
+        self.assertEqual(
+            set(ENCODER_KEY_MAP.values()), {"auto", "cpu", "nvenc", "amf"}
+        )
 
 
 class EncoderArgsNvencTest(unittest.TestCase):
