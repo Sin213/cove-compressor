@@ -208,6 +208,9 @@ class FileQueue(QFrame):
         self._is_video = is_video
         self._thumb_cache = thumb_cache
         self._thumb_labels: dict[Path, QLabel] = {}
+        self._status_labels: dict[Path, QLabel] = {}
+        self._dir_remaining: dict[Path, int] = {}
+        self._dir_worst: dict[Path, str] = {}
         self._entries: list[QueueEntry] = []
 
         self.setObjectName("DropFrame")
@@ -411,10 +414,89 @@ class FileQueue(QFrame):
                     out.append(entry.path)
         return out
 
+    def _owning_entry(self, file_path: Path) -> QueueEntry | None:
+        file_path = Path(file_path)
+        if file_path in self._status_labels:
+            return next((entry for entry in self._entries if entry.path == file_path), None)
+
+        try:
+            resolved_file = file_path.resolve()
+        except OSError:
+            resolved_file = file_path
+        best_entry = None
+        best_depth = -1
+        for entry in self._entries:
+            if not entry.is_dir:
+                continue
+            entry_root = entry.path.resolve()
+            try:
+                resolved_file.relative_to(entry_root)
+            except (OSError, ValueError):
+                continue
+            depth = len(entry_root.parts)
+            if depth > best_depth:
+                best_depth = depth
+                best_entry = entry
+        return best_entry
+
+    def prepare_batch(self, files: list[Path]):
+        self._dir_remaining.clear()
+        self._dir_worst.clear()
+        for label in self._status_labels.values():
+            self._set_status_label(label, "queued")
+        for file_path in files:
+            owner = self._owning_entry(file_path)
+            if owner is not None and owner.is_dir:
+                self._dir_remaining[owner.path] = self._dir_remaining.get(owner.path, 0) + 1
+
+    @staticmethod
+    def _set_status_label(label: QLabel, state: str):
+        text, object_name = {
+            "queued": ("queued", "StatusQueued"),
+            "encoding": ("encoding", "StatusEncoding"),
+            "complete": ("complete", "StatusDone"),
+            "skipped": ("skipped", "StatusSkipped"),
+            "error": ("error", "StatusError"),
+        }.get(state, (state, "StatusQueued"))
+        label.setText(text)
+        label.setObjectName(object_name)
+        label.style().unpolish(label)
+        label.style().polish(label)
+        label.update()
+
+    def set_row_status(self, file_path: Path, state: str):
+        owner = self._owning_entry(file_path)
+        if owner is None:
+            return
+        label = self._status_labels.get(owner.path)
+        if label is None:
+            return
+        if not owner.is_dir:
+            self._set_status_label(label, state)
+            return
+        if state in {"queued", "encoding"}:
+            self._set_status_label(label, state)
+            return
+
+        severity = {"complete": 0, "skipped": 1, "error": 2}
+        current_worst = self._dir_worst.get(owner.path, "complete")
+        if severity.get(state, 0) >= severity.get(current_worst, 0):
+            self._dir_worst[owner.path] = state if state in severity else current_worst
+
+        remaining = max(self._dir_remaining.get(owner.path, 1) - 1, 0)
+        self._dir_remaining[owner.path] = remaining
+        if remaining == 0:
+            self._set_status_label(label, self._dir_worst.get(owner.path, "complete"))
+        else:
+            self._set_status_label(label, "encoding")
+
     # ── internal ──────────────────────────────────────────────────────
 
     def _rebuild_list(self):
         self._thumb_labels.clear()
+        self._status_labels.clear()
+        self._dir_remaining.clear()
+        self._dir_worst.clear()
         self._list.clear()
         for entry in self._entries:
             self._append_item(entry)
@@ -475,6 +557,7 @@ class FileQueue(QFrame):
         status_lbl.setObjectName("StatusQueued")
         status_lbl.setFixedWidth(90)
         status_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._status_labels[entry.path] = status_lbl
         h.addWidget(status_lbl)
 
         rm_btn = QToolButton()
@@ -505,6 +588,9 @@ class FileQueue(QFrame):
             self._apply_thumb(lbl, qimg)
 
     def _remove_entry(self, entry: QueueEntry):
+        self._status_labels.pop(entry.path, None)
+        self._dir_remaining.pop(entry.path, None)
+        self._dir_worst.pop(entry.path, None)
         self._entries = [e for e in self._entries if e is not entry]
         self._rebuild_list()
         self.itemsChanged.emit()
@@ -1100,10 +1186,15 @@ class MainWindow(QMainWindow):
         QLabel#StatusText {{
             color: {theme.TEXT_2}; font-size: 12.5px;
         }}
-        QLabel#StatusQueued {{
-            color: {theme.TEXT_3};
+        QLabel#StatusQueued, QLabel#StatusEncoding, QLabel#StatusDone,
+        QLabel#StatusSkipped, QLabel#StatusError {{
             font-family: "JetBrains Mono", monospace; font-size: 11px;
         }}
+        QLabel#StatusQueued {{ color: {theme.TEXT_3}; }}
+        QLabel#StatusEncoding {{ color: {theme.ACCENT}; }}
+        QLabel#StatusDone {{ color: {theme.OK}; }}
+        QLabel#StatusSkipped {{ color: {theme.WARN}; }}
+        QLabel#StatusError {{ color: {theme.DANGER}; }}
         QLabel#FormatChip {{
             padding: 2px 8px; border-radius: 999px;
             background: #0c1317;
@@ -1436,6 +1527,9 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str) -> None:
         self.msg_queue.put(("status", text))
 
+    def _set_row(self, path: Path, state: str, kind: str) -> None:
+        self.msg_queue.put(("row", (path, state, kind)))
+
     def _set_progress(self, pct: float) -> None:
         self.msg_queue.put(("progress", pct))
 
@@ -1458,6 +1552,10 @@ class MainWindow(QMainWindow):
                     self.log.append(payload)
                 elif kind == "status":
                     latest_status = payload
+                elif kind == "row":
+                    path, state, row_kind = payload
+                    target = self.img_queue if row_kind == "img" else self.vid_queue
+                    target.set_row_status(path, state)
                 elif kind == "progress":
                     latest_progress = payload
                 elif kind == "eta":
@@ -1656,6 +1754,7 @@ class MainWindow(QMainWindow):
         force_format = FORMAT_KEY_MAP[self.img_format.currentText()]
         resize_cap   = RESIZE_CAPS_IMG[self.img_resize.currentText()]
 
+        self.img_queue.prepare_batch(files)
         self.banner.hide()
         self._last_output_dir = output_dir
         self.cancel_flag.clear()
@@ -1708,6 +1807,7 @@ class MainWindow(QMainWindow):
         audio        = self.vid_audio.currentText()
         encoder_pref = ENCODER_KEY_MAP[self.vid_encoder.currentText()]
 
+        self.vid_queue.prepare_batch(files)
         self.banner.hide()
         self._last_output_dir = output_dir
         self.cancel_flag.clear()
@@ -1738,11 +1838,14 @@ class MainWindow(QMainWindow):
         self._set_status(f"0/{total} • {max_workers} workers")
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [
-                pool.submit(compress_image, f, output_dir,
-                            preset, force_format, resize_cap)
-                for f in files
-            ]
+            future_to_path = {}
+            for f in files:
+                future = pool.submit(
+                    compress_image, f, output_dir, preset, force_format, resize_cap
+                )
+                future_to_path[future] = f
+                self._set_row(f, "encoding", "img")
+            futures = list(future_to_path)
             try:
                 for fut in as_completed(futures):
                     if self.cancel_flag.is_set():
@@ -1751,6 +1854,12 @@ class MainWindow(QMainWindow):
                         self._log("[cancelled]")
                         break
                     result = fut.result()
+                    file_path = future_to_path[fut]
+                    row_state = {
+                        "ok": "complete",
+                        "skipped": "skipped",
+                    }.get(result["status"], "error")
+                    self._set_row(file_path, row_state, "img")
                     done += 1
                     self._log(self._fmt(result))
                     if result["status"] == "ok":
@@ -1813,17 +1922,25 @@ class MainWindow(QMainWindow):
                 )
 
             self._set_status(f"{i}/{total}  {f.name}")
+            self._set_row(f, "encoding", "vid")
             result = compress_video(
                 f, output_dir, mode, mode_value, vid_format,
                 res_cap, audio,
                 self.cancel_flag,
                 progress_cb=on_progress,
                 encoder_pref=encoder_pref,
+                on_start=lambda _f=f: self._set_row(_f, "encoding", "vid"),
             )
+            row_state = {
+                "ok": "complete",
+                "skipped": "skipped",
+                "timeout": "skipped",
+            }.get(result["status"], "error")
+            self._set_row(f, row_state, "vid")
             self._log(self._fmt(result))
             if result["status"] == "ok":
                 ok += 1; total_orig += result["original"]; total_new += result["new"]
-            elif result["status"] == "skipped":
+            elif result["status"] in {"skipped", "timeout"}:
                 skipped += 1
                 total_orig += result["original"]
                 total_new += result["original"]
@@ -1849,7 +1966,7 @@ class MainWindow(QMainWindow):
             return (f"[ok]    {name:<42s}  "
                     f"{human_size(r['original']):>10s} → {human_size(r['new']):>10s}  "
                     f"({s:5.1f}% saved){gpu}")
-        if r["status"] == "skipped":
+        if r["status"] in {"skipped", "timeout"}:
             return f"[skip]  {name:<42s}  {r.get('msg', 'skipped')}"
         return     f"[err]   {name:<42s}  {r.get('msg', 'error')}"
 

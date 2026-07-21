@@ -11,12 +11,14 @@ clean. No behavior changes.
 from __future__ import annotations
 
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -39,6 +41,7 @@ except AttributeError:
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp", ".tiff", ".tif"}
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".wmv", ".flv"}
+ENCODE_STALL_TIMEOUT = 120  # Seconds without encoding progress.
 
 DEFAULT_OUTPUT = str(Path.home() / "Downloads" / "cove-compressed")
 
@@ -558,8 +561,8 @@ def calc_video_bitrate_kbps(target_bytes: int, duration: float, audio_kbps: int)
 
 def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
                duration: float | None = None,
-               on_progress=None) -> tuple:
-    """Run ffmpeg, parse progress from stderr, honor cancel."""
+               on_progress=None, on_start=None) -> tuple:
+    """Run ffmpeg while reporting progress and enforcing a stall watchdog."""
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
@@ -569,24 +572,62 @@ def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
         return -1, f"{FFMPEG_BIN} not found on PATH"
 
     stderr_tail: deque = deque(maxlen=40)
+    stderr_queue: queue.Queue = queue.Queue()
     assert proc.stderr is not None
+
+    def _read_stderr():
+        try:
+            for stderr_line in proc.stderr:
+                stderr_queue.put(stderr_line)
+        finally:
+            stderr_queue.put(None)
+
+    def _stop_process():
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    threading.Thread(target=_read_stderr, daemon=True).start()
+    last_progress = time.monotonic()
+    started = False
+    eof_received = False
+
     while True:
-        line = proc.stderr.readline()
-        if line:
-            stderr_tail.append(line.rstrip())
-            if duration and duration > 0 and on_progress:
-                t = parse_ffmpeg_time(line)
-                if t is not None:
-                    on_progress(min(t / duration * 100, 100.0))
-        elif proc.poll() is not None:
-            break
         if cancel_flag.is_set():
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            _stop_process()
             return -2, "cancelled"
+
+        if time.monotonic() - last_progress > ENCODE_STALL_TIMEOUT:
+            _stop_process()
+            return (
+                -3,
+                f"no encoding progress for {ENCODE_STALL_TIMEOUT}s (skipped)",
+            )
+
+        try:
+            line = stderr_queue.get(timeout=1.0)
+        except queue.Empty:
+            line = ""
+
+        if line is None:
+            eof_received = True
+        elif line:
+            stderr_tail.append(line.rstrip())
+            progress_time = parse_ffmpeg_time(line)
+            if progress_time is not None:
+                last_progress = time.monotonic()
+                if not started:
+                    started = True
+                    if on_start:
+                        on_start()
+                if duration and duration > 0 and on_progress:
+                    on_progress(min(progress_time / duration * 100, 100.0))
+
+        if eof_received and proc.poll() is not None:
+            break
 
     tail = list(stderr_tail)[-5:]
     return proc.returncode, "\n".join(tail)
@@ -691,6 +732,7 @@ def compress_video(
     cancel_flag: threading.Event,
     progress_cb=None,
     encoder_pref: str = "auto",
+    on_start=None,
 ) -> dict:
     fmt = VIDEO_FORMATS[video_format_key]
     encoder    = fmt["codec"]
@@ -797,7 +839,13 @@ def compress_video(
                     "-passlogfile", passlog, "-an", "-f", "null", os.devnull],
                 cancel_flag,
                 duration=duration,
-                on_progress=_make_progress(0, 35, "pass 1/2"))
+                on_progress=_make_progress(0, 35, "pass 1/2"),
+                on_start=on_start)
+            if rc == -3:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                return {"file": input_path, "status": "timeout",
+                        "original": original_size, "msg": err}
             if rc == -2:
                 return {"file": input_path, "status": "error", "msg": "cancelled"}
             if rc != 0:
@@ -811,7 +859,8 @@ def compress_video(
                 ] + container_flags + ["-f", muxer, str(tmp_path)],
                 cancel_flag,
                 duration=duration,
-                on_progress=_make_progress(35, 65, "pass 2/2"))
+                on_progress=_make_progress(35, 65, "pass 2/2"),
+                on_start=on_start)
         else:
             rc, err = run_ffmpeg(
                 ffmpeg_base + common_in + vargs(None) + [
@@ -821,8 +870,14 @@ def compress_video(
                 duration=duration,
                 on_progress=_make_progress(
                     0, 100,
-                    "encoding · GPU" if (use_nvenc or use_amf) else "encoding"))
+                    "encoding · GPU" if (use_nvenc or use_amf) else "encoding"),
+                on_start=on_start)
 
+    if rc == -3:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        return {"file": input_path, "status": "timeout",
+                "original": original_size, "msg": err}
     if rc == -2:
         if tmp_path.exists():
             tmp_path.unlink()
