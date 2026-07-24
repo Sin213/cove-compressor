@@ -220,7 +220,8 @@ def _probe_nvenc(encoder: str) -> bool:
     try:
         listing = subprocess.run(
             [FFMPEG_BIN, "-hide_banner", "-encoders"],
-            capture_output=True, text=True, timeout=15, **SUBPROCESS_FLAGS,
+            capture_output=True, text=True, timeout=15,
+            env=clean_subprocess_env(), **SUBPROCESS_FLAGS,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -235,7 +236,8 @@ def _probe_nvenc(encoder: str) -> bool:
             [FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
              "-f", "lavfi", "-i", "color=c=black:s=320x240:r=10:d=0.3",
              "-c:v", encoder, "-f", "null", os.devnull],
-            capture_output=True, text=True, timeout=30, **SUBPROCESS_FLAGS,
+            capture_output=True, text=True, timeout=30,
+            env=clean_subprocess_env(), **SUBPROCESS_FLAGS,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -276,7 +278,8 @@ def _probe_amf(encoder: str) -> bool:
     try:
         listing = subprocess.run(
             [FFMPEG_BIN, "-hide_banner", "-encoders"],
-            capture_output=True, text=True, timeout=15, **SUBPROCESS_FLAGS,
+            capture_output=True, text=True, timeout=15,
+            env=clean_subprocess_env(), **SUBPROCESS_FLAGS,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -288,7 +291,8 @@ def _probe_amf(encoder: str) -> bool:
             [FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
              "-f", "lavfi", "-i", "color=c=black:s=320x240:r=10:d=0.3",
              "-c:v", encoder, "-f", "null", os.devnull],
-            capture_output=True, text=True, timeout=30, **SUBPROCESS_FLAGS,
+            capture_output=True, text=True, timeout=30,
+            env=clean_subprocess_env(), **SUBPROCESS_FLAGS,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -371,7 +375,7 @@ def ffprobe_duration(path: Path) -> float | None:
              "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
             capture_output=True, text=True, timeout=30,
-            **SUBPROCESS_FLAGS,
+            env=clean_subprocess_env(), **SUBPROCESS_FLAGS,
         )
         out = r.stdout.strip()
         return float(out) if out else None
@@ -567,6 +571,7 @@ def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, text=True,
+                                env=clean_subprocess_env(),
                                 **SUBPROCESS_FLAGS)
     except FileNotFoundError:
         return -1, f"{FFMPEG_BIN} not found on PATH"

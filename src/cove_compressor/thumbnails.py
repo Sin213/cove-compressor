@@ -17,7 +17,7 @@ from PIL import Image, ImageOps
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
 
-from .compressor import FFMPEG_BIN, SUBPROCESS_FLAGS, LANCZOS
+from .compressor import FFMPEG_BIN, SUBPROCESS_FLAGS, LANCZOS, clean_subprocess_env
 
 
 class ThumbnailCache(QObject):
@@ -96,7 +96,8 @@ class ThumbnailCache(QObject):
                  "-vf", f"scale={self.THUMB_PX}:{self.THUMB_PX}:"
                         "force_original_aspect_ratio=decrease",
                  tmp_name],
-                capture_output=True, timeout=10, **SUBPROCESS_FLAGS,
+                capture_output=True, timeout=10,
+                env=clean_subprocess_env(), **SUBPROCESS_FLAGS,
             )
             img = QImage(tmp_name)
             return img.copy() if not img.isNull() else None
