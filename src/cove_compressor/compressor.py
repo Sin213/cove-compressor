@@ -10,6 +10,7 @@ clean. No behavior changes.
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
@@ -442,6 +443,273 @@ def open_in_file_manager(path: Path) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
+# ── Optional English subtitle preservation ───────────────────────────────────
+#
+# Re-encoding a video throws away its embedded subtitle streams. When the user
+# opts in, Cove pulls every stream it can confidently identify as English out
+# to a sidecar file *before* the encode starts, so the information survives
+# even if the original is later deleted.
+#
+# The whole feature is fail-closed: anything Cove cannot inspect, extract or
+# finalize marks the result with `subtitles_failed`, which the Tab 2a deletion
+# gate treats as an absolute veto on removing the original.
+
+SUBTITLE_PROBE_TIMEOUT = 30
+
+# Text formats SRT can carry without losing anything that matters.
+SRT_SAFE_SUBTITLE_CODECS = {"subrip", "srt", "mov_text", "text", "webvtt", "vtt"}
+# Styled text formats: flattening these to SRT would drop the styling, so they
+# keep their own container.
+ASS_SUBTITLE_CODECS = {"ass", "ssa"}
+
+_ENGLISH_PRIMARY_TAGS = {"en", "eng"}
+_UNKNOWN_LANG_TAGS = {"", "und", "unknown", "none"}
+
+
+class SubtitleProbeError(RuntimeError):
+    """ffprobe could not tell us what subtitle streams a file contains.
+
+    Deliberately distinct from 'there are no subtitle streams': the first is a
+    preservation failure, the second is a normal outcome.
+    """
+
+
+def ffprobe_subtitle_streams(path: Path) -> list[dict]:
+    """Return one dict per embedded subtitle stream, in file order.
+
+    Each dict carries at least the *absolute* file stream index, which is what
+    extraction maps against. Raises SubtitleProbeError when the answer cannot
+    be trusted - never an empty list on failure.
+    """
+    cmd = [
+        FFPROBE_BIN, "-v", "error",
+        "-select_streams", "s",
+        "-show_entries",
+        "stream=index,codec_name:stream_tags=language,title:"
+        "stream_disposition=default,forced,hearing_impaired",
+        "-of", "json", str(path),
+    ]
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=SUBTITLE_PROBE_TIMEOUT,
+            env=clean_subprocess_env(), **SUBPROCESS_FLAGS,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SubtitleProbeError(f"ffprobe could not run: {e}") from e
+
+    if r.returncode != 0:
+        detail = (r.stderr or "").strip().splitlines()
+        raise SubtitleProbeError(
+            detail[-1][:200] if detail else f"ffprobe exit {r.returncode}")
+
+    try:
+        data = json.loads(r.stdout or "")
+    except (TypeError, ValueError) as e:
+        raise SubtitleProbeError(f"unreadable ffprobe output: {e}") from e
+    if not isinstance(data, dict):
+        raise SubtitleProbeError("unexpected ffprobe output shape")
+
+    streams = data.get("streams")
+    if streams is None:
+        return []
+    if not isinstance(streams, list):
+        raise SubtitleProbeError("unexpected ffprobe stream list")
+
+    out: list[dict] = []
+    for s in streams:
+        if not isinstance(s, dict):
+            raise SubtitleProbeError("unexpected ffprobe stream entry")
+        idx = s.get("index")
+        # bool is an int subclass; an index that is not a plain int means we
+        # cannot map the stream safely, so refuse to guess.
+        if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+            raise SubtitleProbeError("subtitle stream without a usable index")
+        out.append(s)
+    return out
+
+
+def _stream_tag(stream: dict, name: str) -> str:
+    tags = stream.get("tags")
+    if not isinstance(tags, dict):
+        return ""
+    value = tags.get(name)
+    return "" if value is None else str(value)
+
+
+def _primary_language(stream: dict) -> str:
+    """Lowercase primary subtag of the stream's language tag ('en-US' → 'en')."""
+    raw = _stream_tag(stream, "language").strip().lower()
+    return raw.replace("_", "-").split("-")[0].strip()
+
+
+def _disposition(stream: dict, name: str) -> bool:
+    d = stream.get("disposition")
+    if not isinstance(d, dict):
+        return False
+    return bool(d.get(name))
+
+
+def is_english_subtitle_stream(stream: dict) -> bool:
+    """True only when the stream's own metadata says English.
+
+    A recognised language tag is authoritative. The title is consulted only
+    when the language tag is missing/empty/undetermined - being the default
+    track is never evidence of anything.
+    """
+    lang = _primary_language(stream)
+    if lang in _ENGLISH_PRIMARY_TAGS:
+        return True
+    if lang not in _UNKNOWN_LANG_TAGS:
+        return False
+    return "english" in _stream_tag(stream, "title").lower()
+
+
+def subtitle_sidecar_target(codec_name: str | None) -> tuple[str, list[str], str]:
+    """Map a subtitle codec to (sidecar extension, ffmpeg codec args, muxer).
+
+    Preservation first: only codecs SRT can actually represent become .srt,
+    styled text keeps .ass, and everything else - bitmap subtitles included -
+    is copied bit-for-bit into a subtitle-only Matroska (.mks) rather than
+    being discarded.
+    """
+    name = (codec_name or "").strip().lower()
+    if name in SRT_SAFE_SUBTITLE_CODECS:
+        return ".srt", ["-c:s", "srt"], "srt"
+    if name in ASS_SUBTITLE_CODECS:
+        return ".ass", ["-c:s", "ass"], "ass"
+    return ".mks", ["-c:s", "copy"], "matroska"
+
+
+def subtitle_sidecar_name(stem: str, stream: dict, ext: str) -> str:
+    """`<stem>.eng[.forced][.sdh]<ext>` - markers come from disposition flags
+    and title keywords only. Free-form title text never reaches the filesystem.
+    """
+    title = _stream_tag(stream, "title").lower()
+    parts = [stem, "eng"]
+    if _disposition(stream, "forced") or "forced" in title:
+        parts.append("forced")
+    if _disposition(stream, "hearing_impaired") or "sdh" in title:
+        parts.append("sdh")
+    return ".".join(parts) + ext
+
+
+def build_subtitle_extract_cmd(input_path: Path, stream_index: int,
+                               codec_name: str | None, out_path: Path) -> list:
+    """One ffmpeg invocation for exactly one subtitle stream.
+
+    `-map 0:<absolute index>` is the whole safety story: the index comes
+    straight from ffprobe, so subtitle-relative numbering never enters the
+    picture. `-vn -an` plus the explicit muxer keep the sidecar free of any
+    video/audio and independent of filename inference.
+    """
+    _ext, codec_args, muxer = subtitle_sidecar_target(codec_name)
+    return ([FFMPEG_BIN, "-nostdin", "-hide_banner", "-y",
+             "-i", str(input_path),
+             "-map", f"0:{int(stream_index)}", "-vn", "-an"]
+            + codec_args + ["-f", muxer, str(out_path)])
+
+
+def _prepare_english_subtitles(input_path: Path, output_path: Path,
+                               output_dir: Path,
+                               cancel_flag: threading.Event
+                               ) -> tuple[list[dict], list[str], Path | None]:
+    """Extract every English subtitle stream into throwaway temp files.
+
+    Returns (pending, errors, temp_dir). `pending` entries are
+    {"temp": Path, "dest": Path} pairs awaiting finalization; `temp_dir` is
+    the caller's to remove once the job is over, whatever its outcome.
+    """
+    pending: list[dict] = []
+    errors: list[str] = []
+
+    try:
+        streams = ffprobe_subtitle_streams(input_path)
+    except SubtitleProbeError as e:
+        # Explicitly not "there were no subtitles" - fail closed.
+        return pending, [f"subtitle probe failed: {e}"], None
+
+    english = [s for s in streams if is_english_subtitle_stream(s)]
+    if not english:
+        return pending, errors, None
+
+    try:
+        temp_dir = Path(tempfile.mkdtemp(prefix=".cove_subs_", dir=str(output_dir)))
+    except OSError as e:
+        return pending, [f"could not stage subtitles: {e}"], None
+
+    for i, stream in enumerate(english):
+        if cancel_flag.is_set():
+            errors.append("cancelled before subtitle extraction finished")
+            break
+        ext, _codec_args, _muxer = subtitle_sidecar_target(stream.get("codec_name"))
+        temp = temp_dir / f"{i}{ext}"
+        dest = output_dir / subtitle_sidecar_name(output_path.stem, stream, ext)
+        index = stream["index"]
+        rc, err = run_ffmpeg(
+            build_subtitle_extract_cmd(
+                input_path, index, stream.get("codec_name"), temp),
+            cancel_flag)
+        if rc == -2:
+            errors.append("cancelled during subtitle extraction")
+            break
+        if rc != 0:
+            errors.append(f"stream {index}: extraction failed ({_brief(err)})")
+            continue
+        # A zero exit code is not preservation. Only a real, non-empty file is.
+        try:
+            st = os.stat(temp)
+        except OSError:
+            errors.append(f"stream {index}: no subtitle file produced")
+            continue
+        if not stat_mod.S_ISREG(st.st_mode) or st.st_size <= 0:
+            errors.append(f"stream {index}: empty subtitle output")
+            continue
+        pending.append({"temp": temp, "dest": dest})
+
+    return pending, errors, temp_dir
+
+
+def _brief(msg: str, limit: int = 120) -> str:
+    """Last line of an ffmpeg tail, trimmed - logs stay readable."""
+    lines = [ln for ln in (msg or "").strip().splitlines() if ln.strip()]
+    return lines[-1][:limit] if lines else "no detail"
+
+
+def _finalize_subtitle_sidecars(result: dict, pending: list[dict],
+                                errors: list[str]) -> dict:
+    """Move successfully extracted temps to collision-safe sidecar paths.
+
+    `reserve_output` claims each destination with O_CREAT|O_EXCL, so an
+    existing sidecar - the user's or a previous run's - is never touched.
+    Only paths that exist and are non-empty afterwards are reported.
+    """
+    finalized: list[Path] = []
+    for item in pending:
+        dest = item["dest"]
+        claimed: Path | None = None
+        try:
+            claimed, _tmp = reserve_output(dest)
+            os.replace(str(item["temp"]), str(claimed))
+            st = os.stat(claimed)
+            if not stat_mod.S_ISREG(st.st_mode) or st.st_size <= 0:
+                raise OSError("finalized sidecar is empty")
+            finalized.append(claimed)
+        except OSError as e:
+            errors.append(f"{dest.name}: could not finalize sidecar ({e})")
+            if claimed is not None:
+                try:
+                    claimed.unlink()
+                except OSError:
+                    pass
+
+    result["subtitles_extracted"] = finalized
+    if errors:
+        result["subtitles_failed"] = True
+        result["subtitle_errors"] = errors
+    return result
+
+
 # ── Optional source deletion ─────────────────────────────────────────────────
 
 def _same_filesystem_object(src_st, out_st, src: Path, out: Path) -> bool:
@@ -815,7 +1083,15 @@ def compress_video(
     progress_cb=None,
     encoder_pref: str = "auto",
     on_start=None,
+    extract_english_subtitles: bool = False,
 ) -> dict:
+    """Compress one video, optionally rescuing its English subtitle streams.
+
+    `extract_english_subtitles` defaults to False so every existing caller
+    keeps the original behavior byte for byte. When enabled, English streams
+    are pulled to sidecars *before* the encode begins (the encode is what
+    destroys access to them) and only finalized once the video itself lands.
+    """
     fmt = VIDEO_FORMATS[video_format_key]
     encoder    = fmt["codec"]
     codec_key  = fmt["codec_key"]
@@ -893,6 +1169,55 @@ def compress_video(
         nvenc_preset = p["nvenc_preset"]
         amf_quality = p["amf_quality"]
 
+    # Subtitle rescue runs here: after the deterministic pre-encode skips
+    # above (no point extracting for a job that never encodes) and before the
+    # first real encode invocation below.
+    sub_pending: list[dict] = []
+    sub_errors: list[str] = []
+    sub_temp_dir: Path | None = None
+    if extract_english_subtitles:
+        sub_pending, sub_errors, sub_temp_dir = _prepare_english_subtitles(
+            input_path, output_path, output_dir, cancel_flag)
+        if cancel_flag.is_set():
+            if sub_temp_dir is not None:
+                shutil.rmtree(sub_temp_dir, ignore_errors=True)
+            return {"file": input_path, "status": "error", "msg": "cancelled"}
+
+    try:
+        return _encode_video(
+            input_path=input_path, output_path=output_path, tmp_path=tmp_path,
+            original_size=original_size, duration=duration, mode=mode,
+            encoder=encoder, audio_enc=audio_enc, audio_kbps=audio_kbps,
+            muxer=muxer, container_flags=container_flags,
+            resolution_cap=resolution_cap, use_two_pass=use_two_pass,
+            video_kbps=video_kbps, crf=crf, speed_preset=speed_preset,
+            nvenc_preset=nvenc_preset, amf_quality=amf_quality,
+            use_hw=(use_nvenc or use_amf), cancel_flag=cancel_flag,
+            progress_cb=progress_cb, on_start=on_start,
+            extract_english_subtitles=extract_english_subtitles,
+            sub_pending=sub_pending, sub_errors=sub_errors,
+        )
+    finally:
+        # Temps are throwaway either way: finalization moves the keepers out
+        # first, and a failed/skipped/cancelled job leaves nothing behind.
+        if sub_temp_dir is not None:
+            shutil.rmtree(sub_temp_dir, ignore_errors=True)
+
+
+def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
+                  original_size: int, duration, mode: str, encoder: str,
+                  audio_enc: str, audio_kbps, muxer: str,
+                  container_flags: list, resolution_cap, use_two_pass: bool,
+                  video_kbps, crf, speed_preset: str, nvenc_preset: str,
+                  amf_quality: str, use_hw: bool,
+                  cancel_flag: threading.Event, progress_cb, on_start,
+                  extract_english_subtitles: bool,
+                  sub_pending: list, sub_errors: list) -> dict:
+    """The unchanged encode + finalize half of `compress_video`.
+
+    Split out only so subtitle temp cleanup gets one honest `finally` around
+    every exit path; the ffmpeg command construction below is untouched.
+    """
     vf = build_scale_filter(resolution_cap) if resolution_cap else None
     ffmpeg_base = [FFMPEG_BIN, "-nostdin", "-hide_banner", "-y"]
     common_in = ["-i", str(input_path)]
@@ -952,7 +1277,7 @@ def compress_video(
                 duration=duration,
                 on_progress=_make_progress(
                     0, 100,
-                    "encoding · GPU" if (use_nvenc or use_amf) else "encoding"),
+                    "encoding · GPU" if use_hw else "encoding"),
                 on_start=on_start)
 
     if rc == -3:
@@ -979,5 +1304,11 @@ def compress_video(
                 "msg": "compression would increase size (try Target reduction mode)"}
 
     tmp_path.rename(output_path)
-    return {"file": input_path, "output": output_path, "status": "ok",
-            "original": original_size, "new": new_size, "encoder": encoder}
+    result = {"file": input_path, "output": output_path, "status": "ok",
+              "original": original_size, "new": new_size, "encoder": encoder}
+    # Sidecars are finalized only now, against a video output that exists.
+    # Any probe/extraction/finalization failure sets `subtitles_failed`, which
+    # `delete_source_if_eligible` treats as a veto on removing the original.
+    if extract_english_subtitles:
+        _finalize_subtitle_sidecars(result, sub_pending, sub_errors)
+    return result

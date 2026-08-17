@@ -1162,6 +1162,18 @@ class MainWindow(QMainWindow):
         self.vid_audio.setCurrentText("192")
         v.addWidget(_field("Audio kbps", self.vid_audio))
 
+        # Video-only: images have no subtitle streams to rescue.
+        self.vid_subs_chk = QCheckBox("Extract English subtitles before conversion")
+        self.vid_subs_chk.setChecked(False)
+        self.vid_subs_chk.setToolTip(
+            "Extracts embedded English subtitles as sidecar files before "
+            "conversion.\n"
+            "Bitmap subtitles may be preserved as .mks.\n"
+            "Existing sidecar files are never overwritten.\n"
+            "If subtitles cannot be preserved, the original is always kept."
+        )
+        v.addWidget(self.vid_subs_chk)
+
         v.addStretch(1)
         return w
 
@@ -1507,6 +1519,8 @@ class MainWindow(QMainWindow):
 
         self.delete_source_chk.setChecked(
             s.value("delete/source_after_success", False, type=bool))
+        self.vid_subs_chk.setChecked(
+            s.value("vid/extract_english_subtitles", False, type=bool))
 
         if s.value("log/visible", False, type=bool):
             self.log_toggle.setChecked(True)
@@ -1531,6 +1545,8 @@ class MainWindow(QMainWindow):
         s.setValue("vid/audio",       self.vid_audio.currentText())
         s.setValue("vid/size_mb",     self.vid_size_mb.value())
         s.setValue("vid/pct",         self.vid_pct.value())
+        s.setValue("vid/extract_english_subtitles",
+                   self.vid_subs_chk.isChecked())
         s.setValue("delete/source_after_success",
                    self.delete_source_chk.isChecked())
         s.setValue("log/visible",     self.log_toggle.isChecked())
@@ -1833,6 +1849,7 @@ class MainWindow(QMainWindow):
         encoder_pref = ENCODER_KEY_MAP[self.vid_encoder.currentText()]
         # Captured on the GUI thread; the worker only sees a plain bool.
         delete_source = bool(self.delete_source_chk.isChecked())
+        extract_subs = bool(self.vid_subs_chk.isChecked())
 
         self.vid_queue.prepare_batch(files)
         self.banner.hide()
@@ -1848,7 +1865,7 @@ class MainWindow(QMainWindow):
         threading.Thread(
             target=self._run_video_batch,
             args=(files, output_dir, mode, mode_value, vid_format, res_cap,
-                  audio, encoder_pref, delete_source),
+                  audio, encoder_pref, delete_source, extract_subs),
             daemon=True,
         ).start()
 
@@ -1933,11 +1950,12 @@ class MainWindow(QMainWindow):
 
     def _run_video_batch(self, files, output_dir, mode, mode_value,
                          vid_format, res_cap, audio, encoder_pref="auto",
-                         delete_source=False):
+                         delete_source=False, extract_subs=False):
         total = len(files)
         total_orig = total_new = 0
         ok = skipped = errors = 0
         deleted = delete_failed = 0
+        subs_ok = subs_failed = 0
         t0 = time.time()
 
         for i, f in enumerate(files, start=1):
@@ -1971,7 +1989,16 @@ class MainWindow(QMainWindow):
                 progress_cb=on_progress,
                 encoder_pref=encoder_pref,
                 on_start=lambda _f=f: self._set_row(_f, "encoding", "vid"),
+                extract_english_subtitles=extract_subs,
             )
+            subs_ok += len(result.get("subtitles_extracted") or ())
+            if result.get("subtitles_failed"):
+                subs_failed += 1
+                for msg in (result.get("subtitle_errors") or ())[:3]:
+                    self._log(f"[subs]  {f.name}: {msg}")
+                if delete_source and result["status"] == "ok":
+                    self._log(f"[subs]  {f.name}: original kept - subtitles "
+                              f"could not be preserved")
             delete_source_if_eligible(result, delete_source)
             if result.get("source_deleted") is True:
                 deleted += 1
@@ -1997,7 +2024,7 @@ class MainWindow(QMainWindow):
             self._set_progress((i / total) * 100)
 
         self._summary(ok, skipped, errors, total_orig, total_new, "video",
-                      deleted, delete_failed)
+                      deleted, delete_failed, subs_ok, subs_failed)
         self._set_status("Done")
         self._set_eta("")
         self._finish()
@@ -2021,13 +2048,18 @@ class MainWindow(QMainWindow):
 
     def _summary(self, ok: int, skipped: int, errors: int,
                  total_orig: int, total_new: int, kind: str,
-                 deleted: int = 0, delete_failed: int = 0) -> None:
+                 deleted: int = 0, delete_failed: int = 0,
+                 subs_ok: int = 0, subs_failed: int = 0) -> None:
         self._log("-" * 76)
         self._log(f"Done.  ok={ok}   skipped={skipped}   errors={errors}")
         # Only speak up when source deletion was actually in play.
         if deleted or delete_failed:
             self._log(f"Deleted originals: {deleted}   "
                       f"Delete failures: {delete_failed}")
+        # Likewise: silent unless subtitle extraction actually did something.
+        if subs_ok or subs_failed:
+            self._log(f"English subtitles extracted: {subs_ok}   "
+                      f"Subtitle preservation failures: {subs_failed}")
         if total_orig > 0:
             self._log(f"Total: {human_size(total_orig)} → {human_size(total_new)}  "
                       f"({pct_saved(total_orig, total_new):.1f}% saved)")
