@@ -85,6 +85,7 @@ jobs:
             release/*.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
+          draft: true
 
   build-windows:
     needs: resolve-version
@@ -137,3 +138,4 @@ jobs:
             release/*.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
+          draft: true

@@ -17,6 +17,39 @@ GitHub Actions.
 
 ---
 
+## What's new in 2.3.0
+
+Two opt-in conversion options, both OFF by default so existing behaviour is
+unchanged until you turn them on.
+
+### Delete source after successful conversion
+
+A shared checkbox (Images and Videos) that removes the original file once its
+conversion finishes. Deletion is permanent and does not use the Trash. It only
+runs when the result is a real success: skipped, errored, cancelled, and
+timed-out files always keep their source, and so does any file whose subtitle
+preservation failed.
+
+### Extract English subtitles before conversion
+
+A Videos checkbox that rescues embedded English subtitle streams into sidecar
+files before the encode begins, since re-encoding drops them. Streams are
+matched on language tag first, then on an English title. Text subtitles become
+`.srt`, styled subtitles keep `.ass`, and anything else (bitmap subtitles
+included) is copied into a subtitle-only `.mks`.
+
+Sidecars are named `<output>.eng[.forced][.sdh].<ext>` next to the converted
+file. An existing file with that name is never overwritten: the new sidecar
+gets a numbered suffix instead. Videos with no English subtitles are a normal
+result, not an error. When both options are on, the source is deleted only
+after the converted video and its sidecars are safely in place.
+
+The run summary reports both, for example
+`Deleted originals: 1   Delete failures: 0` and
+`English subtitles extracted: 1   Subtitle preservation failures: 0`.
+
+---
+
 ## What's new in 2.0
 
 Cove Compressor 2.0 is a full redesign on top of the same compression core that
@@ -73,6 +106,12 @@ simplified away.
 - Quality presets: Web Small / Balanced / Archive Light (CRF values tuned per
   codec — x265, x264, VP9 — plus matching NVENC `-cq` targets and AMF `-qp`
   targets)
+- **Extract English subtitles before conversion** (default off) - pulls embedded
+  English subtitle streams to sidecar files before the encode
+
+**Both tabs:**
+- **Delete source after successful conversion** (default off) - permanently
+  removes the original after a successful result, no Trash
 
 ### Hardware acceleration (NVENC / AMF)
 
@@ -131,7 +170,8 @@ don't poison the child process).
 
 - **Persistent settings** — last-used preset, format, encoder, resize cap,
   video method values, audio bitrate, resolution cap, output folder, log
-  visibility, last tab, and window geometry all survive restarts via `QSettings`
+  visibility, last tab, subtitle extraction, source deletion, and window
+  geometry all survive restarts via `QSettings`
   (`~/.config/Cove/Cove Compressor.conf` on Linux,
    `HKCU\Software\Cove\Cove Compressor` on Windows).
 - **Auto-updater** — on launch a background thread checks GitHub Releases; when
@@ -299,6 +339,8 @@ build.ps1              # Windows Setup.exe + Portable.exe builder
 | Videos | Encoder           | Automatic (GPU if available) |
 | Videos | Resolution cap    | Original             |
 | Videos | Audio bitrate     | 192 kbps             |
+| Videos | Extract English subtitles | Off           |
+| Both   | Delete source after successful conversion | Off |
 | —      | Output folder     | `~/Downloads/cove-compressed` |
 
 ---
