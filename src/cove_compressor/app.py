@@ -35,9 +35,10 @@ from PySide6.QtGui import (
     QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QSizeGrip, QSizePolicy, QSpinBox, QStackedWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QSizeGrip, QSizePolicy, QSpinBox,
+    QStackedWidget,
     QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -50,7 +51,8 @@ from .compressor import (
     IMAGE_EXTS, IMAGE_PRESETS, RESIZE_CAPS_IMG, RESOLUTION_CAPS,
     VIDEO_EXTS, VIDEO_FORMATS, VIDEO_MODES, VIDEO_QUALITY_PRESETS,
     any_amf_available, any_nvenc_available, compress_image, compress_video,
-    format_eta, human_size, open_in_file_manager, pct_saved, scan_files,
+    delete_source_if_eligible, format_eta, human_size, open_in_file_manager,
+    pct_saved, scan_files,
 )
 from .thumbnails import ThumbnailCache
 from .titlebar import TitleBar, FramelessResizer
@@ -991,6 +993,20 @@ class MainWindow(QMainWindow):
         self.options_stack.addWidget(self._build_image_options())
         self.options_stack.addWidget(self._build_video_options())
         self.options_panel.add(self.options_stack)
+
+        # Shared across both tabs on purpose: one authoritative boolean for the
+        # whole batch, images and videos alike. Lives outside the stack so it
+        # never reads as a video-only option.
+        self.delete_source_chk = QCheckBox("Delete source after successful conversion")
+        self.delete_source_chk.setChecked(False)
+        self.delete_source_chk.setToolTip(
+            "Applies to both images and videos.\n"
+            "Permanent deletion - does not use Trash / Recycle Bin.\n"
+            "Skipped, failed, cancelled and timed-out files are kept.\n"
+            "When the output folder is the source folder, the converted file "
+            "may get Cove's usual collision suffix (e.g. name_1)."
+        )
+        self.options_panel.add(self.delete_source_chk)
         side.addWidget(self.options_panel)
 
         # Privacy note
@@ -1489,6 +1505,9 @@ class MainWindow(QMainWindow):
             pass
         self._update_vid_mode(self.vid_mode.currentText())
 
+        self.delete_source_chk.setChecked(
+            s.value("delete/source_after_success", False, type=bool))
+
         if s.value("log/visible", False, type=bool):
             self.log_toggle.setChecked(True)
             self._on_log_toggled()
@@ -1512,6 +1531,8 @@ class MainWindow(QMainWindow):
         s.setValue("vid/audio",       self.vid_audio.currentText())
         s.setValue("vid/size_mb",     self.vid_size_mb.value())
         s.setValue("vid/pct",         self.vid_pct.value())
+        s.setValue("delete/source_after_success",
+                   self.delete_source_chk.isChecked())
         s.setValue("log/visible",     self.log_toggle.isChecked())
         s.setValue("ui/tab",          self._current_kind())
 
@@ -1753,6 +1774,9 @@ class MainWindow(QMainWindow):
         preset       = self.img_preset.currentText()
         force_format = FORMAT_KEY_MAP[self.img_format.currentText()]
         resize_cap   = RESIZE_CAPS_IMG[self.img_resize.currentText()]
+        # Read the widget here, on the GUI thread, and hand the worker a plain
+        # bool. Worker threads must never touch Qt widget state.
+        delete_source = bool(self.delete_source_chk.isChecked())
 
         self.img_queue.prepare_batch(files)
         self.banner.hide()
@@ -1766,7 +1790,8 @@ class MainWindow(QMainWindow):
 
         threading.Thread(
             target=self._run_image_batch,
-            args=(files, output_dir, preset, force_format, resize_cap),
+            args=(files, output_dir, preset, force_format, resize_cap,
+                  delete_source),
             daemon=True,
         ).start()
 
@@ -1806,6 +1831,8 @@ class MainWindow(QMainWindow):
         res_cap      = RESOLUTION_CAPS[self.vid_res.currentText()]
         audio        = self.vid_audio.currentText()
         encoder_pref = ENCODER_KEY_MAP[self.vid_encoder.currentText()]
+        # Captured on the GUI thread; the worker only sees a plain bool.
+        delete_source = bool(self.delete_source_chk.isChecked())
 
         self.vid_queue.prepare_batch(files)
         self.banner.hide()
@@ -1821,16 +1848,18 @@ class MainWindow(QMainWindow):
         threading.Thread(
             target=self._run_video_batch,
             args=(files, output_dir, mode, mode_value, vid_format, res_cap,
-                  audio, encoder_pref),
+                  audio, encoder_pref, delete_source),
             daemon=True,
         ).start()
 
     # ── batch workers ─────────────────────────────────────────────────
 
-    def _run_image_batch(self, files, output_dir, preset, force_format, resize_cap):
+    def _run_image_batch(self, files, output_dir, preset, force_format, resize_cap,
+                         delete_source=False):
         total = len(files)
         total_orig = total_new = 0
         ok = skipped = errors = 0
+        deleted = delete_failed = 0
         t0 = time.time()
         done = 0
 
@@ -1855,6 +1884,15 @@ class MainWindow(QMainWindow):
                         break
                     result = fut.result()
                     file_path = future_to_path[fut]
+                    # Per completed result, never as a post-batch sweep: the
+                    # output for this one file is already finalized here.
+                    delete_source_if_eligible(result, delete_source)
+                    if result.get("source_deleted") is True:
+                        deleted += 1
+                    elif "delete_error" in result:
+                        delete_failed += 1
+                        self._log(f"[del]   could not delete source "
+                                  f"{file_path.name}: {result['delete_error']}")
                     row_state = {
                         "ok": "complete",
                         "skipped": "skipped",
@@ -1887,16 +1925,19 @@ class MainWindow(QMainWindow):
                     for pending in futures:
                         pending.cancel()
 
-        self._summary(ok, skipped, errors, total_orig, total_new, "image")
+        self._summary(ok, skipped, errors, total_orig, total_new, "image",
+                      deleted, delete_failed)
         self._set_status("Done")
         self._set_eta("")
         self._finish()
 
     def _run_video_batch(self, files, output_dir, mode, mode_value,
-                         vid_format, res_cap, audio, encoder_pref="auto"):
+                         vid_format, res_cap, audio, encoder_pref="auto",
+                         delete_source=False):
         total = len(files)
         total_orig = total_new = 0
         ok = skipped = errors = 0
+        deleted = delete_failed = 0
         t0 = time.time()
 
         for i, f in enumerate(files, start=1):
@@ -1931,6 +1972,13 @@ class MainWindow(QMainWindow):
                 encoder_pref=encoder_pref,
                 on_start=lambda _f=f: self._set_row(_f, "encoding", "vid"),
             )
+            delete_source_if_eligible(result, delete_source)
+            if result.get("source_deleted") is True:
+                deleted += 1
+            elif "delete_error" in result:
+                delete_failed += 1
+                self._log(f"[del]   could not delete source "
+                          f"{f.name}: {result['delete_error']}")
             row_state = {
                 "ok": "complete",
                 "skipped": "skipped",
@@ -1948,7 +1996,8 @@ class MainWindow(QMainWindow):
                 errors += 1
             self._set_progress((i / total) * 100)
 
-        self._summary(ok, skipped, errors, total_orig, total_new, "video")
+        self._summary(ok, skipped, errors, total_orig, total_new, "video",
+                      deleted, delete_failed)
         self._set_status("Done")
         self._set_eta("")
         self._finish()
@@ -1971,9 +2020,14 @@ class MainWindow(QMainWindow):
         return     f"[err]   {name:<42s}  {r.get('msg', 'error')}"
 
     def _summary(self, ok: int, skipped: int, errors: int,
-                 total_orig: int, total_new: int, kind: str) -> None:
+                 total_orig: int, total_new: int, kind: str,
+                 deleted: int = 0, delete_failed: int = 0) -> None:
         self._log("-" * 76)
         self._log(f"Done.  ok={ok}   skipped={skipped}   errors={errors}")
+        # Only speak up when source deletion was actually in play.
+        if deleted or delete_failed:
+            self._log(f"Deleted originals: {deleted}   "
+                      f"Delete failures: {delete_failed}")
         if total_orig > 0:
             self._log(f"Total: {human_size(total_orig)} → {human_size(total_new)}  "
                       f"({pct_saved(total_orig, total_new):.1f}% saved)")

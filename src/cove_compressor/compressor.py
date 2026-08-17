@@ -14,6 +14,7 @@ import os
 import queue
 import re
 import shutil
+import stat as stat_mod
 import subprocess
 import sys
 import tempfile
@@ -439,6 +440,82 @@ def open_in_file_manager(path: Path) -> None:
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QDesktopServices
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+
+# ── Optional source deletion ─────────────────────────────────────────────────
+
+def _same_filesystem_object(src_st, out_st, src: Path, out: Path) -> bool:
+    """True when source and output are provably the same file. Any doubt is
+    resolved as 'same' by the callers, which fail closed."""
+    if os.path.normcase(os.path.abspath(str(src))) == \
+       os.path.normcase(os.path.abspath(str(out))):
+        return True
+    if os.path.normcase(os.path.realpath(str(src))) == \
+       os.path.normcase(os.path.realpath(str(out))):
+        return True
+    # Hard links and bind-mount aliases: same device + same inode. On Windows
+    # st_ino is only meaningful when non-zero, so ignore a zero inode pair.
+    if src_st.st_ino and src_st.st_ino == out_st.st_ino \
+       and src_st.st_dev == out_st.st_dev:
+        return True
+    return False
+
+
+def delete_source_if_eligible(result: dict, enabled: bool = False) -> dict:
+    """Permanently delete the original input of a *successful* conversion.
+
+    Opt-in only: the default is off, so any caller that forgets the flag keeps
+    the source. Deletion is a plain unlink - no Trash, no Recycle Bin - and is
+    only attempted when the finalized output is proven to be a non-empty
+    regular file distinct from the source. Any filesystem error fails closed:
+    the source is kept and the failure is reported on the result. A deletion
+    failure never downgrades a successful conversion.
+
+    Mutates and returns the same result dict.
+    """
+    if enabled is not True:
+        return result
+    if result.get("status") != "ok":
+        return result
+    if result.get("subtitles_failed"):
+        return result
+
+    out = result.get("output")
+    src = result.get("file")
+    if not out or not src:
+        return result
+    out = Path(out)
+    src = Path(src)
+
+    try:
+        try:
+            out_st = os.stat(out)
+            src_st = os.stat(src)
+        except FileNotFoundError:
+            # Nothing to delete, or no output to justify deleting. Not an
+            # error worth reporting - stay quiet.
+            return result
+
+        if not stat_mod.S_ISREG(out_st.st_mode) or out_st.st_size <= 0:
+            return result
+        if not stat_mod.S_ISREG(src_st.st_mode):
+            return result
+        if _same_filesystem_object(src_st, out_st, src, out):
+            return result
+    except OSError as e:
+        result["source_deleted"] = False
+        result["delete_error"] = f"could not verify source: {e}"
+        return result
+
+    try:
+        os.unlink(src)
+    except OSError as e:
+        result["source_deleted"] = False
+        result["delete_error"] = str(e)
+        return result
+
+    result["source_deleted"] = True
+    return result
 
 
 # ── Image compression ────────────────────────────────────────────────────────
