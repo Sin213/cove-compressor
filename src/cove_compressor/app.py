@@ -33,12 +33,13 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut,
+    QTextDocument,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QProgressBar, QPushButton, QSizeGrip, QSizePolicy, QSpinBox,
-    QStackedWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
+    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizeGrip, QSizePolicy,
+    QSpinBox, QStackedWidget,
     QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -731,6 +732,29 @@ class TabPill(QPushButton):
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Log pop-out
+# ───────────────────────────────────────────────────────────────────────────
+
+class LogPopout(QDialog):
+    """Modeless second window sharing the main log's QTextDocument, so every
+    line appended to the in-app log also appears here live."""
+
+    def __init__(self, document: QTextDocument, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} log")
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self.resize(720, 520)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setDocument(document)
+        view.setObjectName("LogView")
+        v.addWidget(view)
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # Main window
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -760,6 +784,7 @@ class MainWindow(QMainWindow):
         self.cancel_flag = threading.Event()
         self._last_output_dir: Path | None = None
         self._thumb_cache = ThumbnailCache(self)
+        self._log_popout = None
 
         self._build_ui()
         self._restore_settings()
@@ -967,6 +992,14 @@ class MainWindow(QMainWindow):
         clr_btn.setObjectName("LogActionBtn")
         clr_btn.clicked.connect(lambda: self.log.clear())
         log_top.addWidget(clr_btn)
+        pop_btn = QToolButton()
+        pop_btn.setText("Pop out")
+        pop_btn.setAutoRaise(True)
+        pop_btn.setObjectName("LogActionBtn")
+        pop_btn.setToolTip("Open the log in its own window")
+        pop_btn.clicked.connect(self._toggle_log_popout)
+        log_top.addWidget(pop_btn)
+        self.log_popout_btn = pop_btn
         self.log_panel.add_layout(log_top)
 
         self.log = QTextEdit()
@@ -1465,6 +1498,17 @@ class MainWindow(QMainWindow):
 
     def _copy_log(self) -> None:
         QApplication.clipboard().setText(self.log.toPlainText())
+
+    def _toggle_log_popout(self) -> None:
+        if self._log_popout is not None and self._log_popout.isVisible():
+            self._log_popout.close()
+            self.log_popout_btn.setText("Pop out")
+            return
+        if self._log_popout is None:
+            self._log_popout = LogPopout(self.log.document(), self)
+        self._log_popout.setWindowFlag(Qt.WindowMinMaxButtonsHint, True)
+        self._log_popout.show()
+        self.log_popout_btn.setText("Pop in")
 
     # ── output folder helpers ──────────────────────────────────────────
 

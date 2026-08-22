@@ -257,6 +257,7 @@ QComboBox {{
     padding: 7px 12px;
     padding-right: 32px;
     font-size: 12.5px;
+    min-height: 18px;
 }}
 QComboBox:hover {{
     border-color: {BORDER_HI};
@@ -294,6 +295,7 @@ QDoubleSpinBox, QSpinBox {{
     border: 1px solid {BORDER};
     border-radius: 6px;
     padding: 4px 6px;
+    min-height: 18px;
 }}
 
 QCheckBox {{
