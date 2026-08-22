@@ -52,7 +52,7 @@ from .compressor import (
     VIDEO_EXTS, VIDEO_FORMATS, VIDEO_MODES, VIDEO_QUALITY_PRESETS,
     any_amf_available, any_nvenc_available, compress_image, compress_video,
     delete_source_if_eligible, format_eta, human_size, open_in_file_manager,
-    pct_saved, scan_files,
+    output_dir_for, pct_saved, scan_files,
 )
 from .thumbnails import ThumbnailCache
 from .titlebar import TitleBar, FramelessResizer
@@ -1038,17 +1038,24 @@ class MainWindow(QMainWindow):
         self.output_edit = QLineEdit(DEFAULT_OUTPUT)
         self.output_edit.setPlaceholderText("Output folder…")
         path_row.addWidget(self.output_edit, stretch=1)
-        browse_btn = QPushButton("Browse")
-        browse_btn.clicked.connect(self._browse_output)
-        path_row.addWidget(browse_btn)
-        open_btn = QToolButton()
-        open_btn.setText("↗")
-        open_btn.setToolTip("Open output folder")
-        open_btn.setObjectName("OpenFolderBtn")
-        open_btn.setFixedSize(34, 34)
-        open_btn.clicked.connect(self._open_output_folder_from_edit)
-        path_row.addWidget(open_btn)
+        self.browse_btn = QPushButton("Browse")
+        self.browse_btn.clicked.connect(self._browse_output)
+        path_row.addWidget(self.browse_btn)
+        self.open_btn = QToolButton()
+        self.open_btn.setText("↗")
+        self.open_btn.setToolTip("Open output folder")
+        self.open_btn.setObjectName("OpenFolderBtn")
+        self.open_btn.setFixedSize(34, 34)
+        self.open_btn.clicked.connect(self._open_output_folder_from_edit)
+        path_row.addWidget(self.open_btn)
         dest.add_layout(path_row)
+        self.same_dir_chk = QCheckBox("Save into each file's own folder")
+        self.same_dir_chk.setChecked(False)
+        self.same_dir_chk.setToolTip(
+            "Writes each result next to its original file instead of the\n"
+            "folder above. Name collisions get numbered suffixes.")
+        self.same_dir_chk.toggled.connect(self._sync_dest_enabled)
+        dest.add(self.same_dir_chk)
         side.addWidget(dest)
 
         side.addStretch(1)
@@ -1461,6 +1468,11 @@ class MainWindow(QMainWindow):
 
     # ── output folder helpers ──────────────────────────────────────────
 
+    def _sync_dest_enabled(self, same_as_source: bool) -> None:
+        self.output_edit.setDisabled(same_as_source)
+        self.browse_btn.setDisabled(same_as_source)
+        self.open_btn.setDisabled(same_as_source)
+
     def _browse_output(self) -> None:
         start = self.output_edit.text() or str(Path.home())
         folder = QFileDialog.getExistingDirectory(self, "Select output folder", start)
@@ -1521,6 +1533,8 @@ class MainWindow(QMainWindow):
             s.value("delete/source_after_success", False, type=bool))
         self.vid_subs_chk.setChecked(
             s.value("vid/extract_english_subtitles", False, type=bool))
+        self.same_dir_chk.setChecked(
+            s.value("output/same_as_source", False, type=bool))
 
         if s.value("log/visible", False, type=bool):
             self.log_toggle.setChecked(True)
@@ -1549,6 +1563,8 @@ class MainWindow(QMainWindow):
                    self.vid_subs_chk.isChecked())
         s.setValue("delete/source_after_success",
                    self.delete_source_chk.isChecked())
+        s.setValue("output/same_as_source",
+                   self.same_dir_chk.isChecked())
         s.setValue("log/visible",     self.log_toggle.isChecked())
         s.setValue("ui/tab",          self._current_kind())
 
@@ -1745,7 +1761,16 @@ class MainWindow(QMainWindow):
             return None
         return files
 
-    def _prepare_output(self, input_paths: list) -> Path | None:
+    def _prepare_output(self, input_paths: list,
+                        same_as_source: bool = False) -> Path | None:
+        if same_as_source:
+            # Opt-in per-file mode: every result is written next to its own
+            # source file, so the checkbox itself is the consent and the
+            # shared-folder same-dir prompt doesn't apply. The first file's
+            # folder doubles as the banner's "Open output folder" target.
+            if not input_paths:
+                return None
+            return input_paths[0].parent
         out_str = self.output_edit.text().strip()
         if not out_str:
             QMessageBox.warning(self, APP_NAME, "Pick an output folder.")
@@ -1783,7 +1808,10 @@ class MainWindow(QMainWindow):
         files = self._collect_from_queue(self.img_queue, "image")
         if not files:
             return
-        output_dir = self._prepare_output(files)
+        # Read the widget here, on the GUI thread, and hand the worker a plain
+        # bool. Worker threads must never touch Qt widget state.
+        same_dir = bool(self.same_dir_chk.isChecked())
+        output_dir = self._prepare_output(files, same_dir)
         if not output_dir:
             return
 
@@ -1807,7 +1835,7 @@ class MainWindow(QMainWindow):
         threading.Thread(
             target=self._run_image_batch,
             args=(files, output_dir, preset, force_format, resize_cap,
-                  delete_source),
+                  delete_source, same_dir),
             daemon=True,
         ).start()
 
@@ -1823,7 +1851,8 @@ class MainWindow(QMainWindow):
         files = self._collect_from_queue(self.vid_queue, "video")
         if not files:
             return
-        output_dir = self._prepare_output(files)
+        same_dir = bool(self.same_dir_chk.isChecked())
+        output_dir = self._prepare_output(files, same_dir)
         if not output_dir:
             return
 
@@ -1865,14 +1894,14 @@ class MainWindow(QMainWindow):
         threading.Thread(
             target=self._run_video_batch,
             args=(files, output_dir, mode, mode_value, vid_format, res_cap,
-                  audio, encoder_pref, delete_source, extract_subs),
+                  audio, encoder_pref, delete_source, extract_subs, same_dir),
             daemon=True,
         ).start()
 
     # ── batch workers ─────────────────────────────────────────────────
 
     def _run_image_batch(self, files, output_dir, preset, force_format, resize_cap,
-                         delete_source=False):
+                         delete_source=False, same_as_source=False):
         total = len(files)
         total_orig = total_new = 0
         ok = skipped = errors = 0
@@ -1887,7 +1916,9 @@ class MainWindow(QMainWindow):
             future_to_path = {}
             for f in files:
                 future = pool.submit(
-                    compress_image, f, output_dir, preset, force_format, resize_cap
+                    compress_image, f,
+                    output_dir_for(f, output_dir, same_as_source),
+                    preset, force_format, resize_cap
                 )
                 future_to_path[future] = f
                 self._set_row(f, "encoding", "img")
@@ -1950,7 +1981,8 @@ class MainWindow(QMainWindow):
 
     def _run_video_batch(self, files, output_dir, mode, mode_value,
                          vid_format, res_cap, audio, encoder_pref="auto",
-                         delete_source=False, extract_subs=False):
+                         delete_source=False, extract_subs=False,
+                         same_as_source=False):
         total = len(files)
         total_orig = total_new = 0
         ok = skipped = errors = 0
@@ -1983,7 +2015,8 @@ class MainWindow(QMainWindow):
             self._set_status(f"{i}/{total}  {f.name}")
             self._set_row(f, "encoding", "vid")
             result = compress_video(
-                f, output_dir, mode, mode_value, vid_format,
+                f, output_dir_for(f, output_dir, same_as_source),
+                mode, mode_value, vid_format,
                 res_cap, audio,
                 self.cancel_flag,
                 progress_cb=on_progress,

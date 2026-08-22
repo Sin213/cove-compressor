@@ -166,12 +166,18 @@ shortcut that opens the folder in your OS file manager (inside the AppImage
 this strips `LD_LIBRARY_PATH` before spawning `xdg-open` so the bundle's libs
 don't poison the child process).
 
+**Save into each file's own folder** (default off) is an opt-in that writes
+every result next to its original instead of the shared Save-to folder — each
+file in a recursive folder drop returns to its own subdirectory. While it's on,
+the Save-to field, Browse, and ↗ controls grey out, and name collisions get
+numbered suffixes (`photo_1.webp`).
+
 ### Other polish
 
 - **Persistent settings** — last-used preset, format, encoder, resize cap,
-  video method values, audio bitrate, resolution cap, output folder, log
-  visibility, last tab, subtitle extraction, source deletion, and window
-  geometry all survive restarts via `QSettings`
+  video method values, audio bitrate, resolution cap, output folder, same-
+  folder output, log visibility, last tab, subtitle extraction, source
+  deletion, and window geometry all survive restarts via `QSettings`
   (`~/.config/Cove/Cove Compressor.conf` on Linux,
    `HKCU\Software\Cove\Cove Compressor` on Windows).
 - **Auto-updater** — on launch a background thread checks GitHub Releases; when
@@ -341,6 +347,7 @@ build.ps1              # Windows Setup.exe + Portable.exe builder
 | Videos | Audio bitrate     | 192 kbps             |
 | Videos | Extract English subtitles | Off           |
 | Both   | Delete source after successful conversion | Off |
+| Both   | Save into each file's own folder   | Off                  |
 | —      | Output folder     | `~/Downloads/cove-compressed` |
 
 ---

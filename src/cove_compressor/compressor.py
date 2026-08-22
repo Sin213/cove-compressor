@@ -368,6 +368,12 @@ def reserve_output(base: Path) -> tuple[Path, Path]:
             i += 1
 
 
+def output_dir_for(input_file: Path, shared_dir: Path,
+                   same_as_source: bool = False) -> Path:
+    """Directory a job writes into: its own source folder when opted in."""
+    return input_file.parent if same_as_source else shared_dir
+
+
 def ffprobe_duration(path: Path) -> float | None:
     if not shutil.which(FFPROBE_BIN):
         return None
