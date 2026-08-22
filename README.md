@@ -11,9 +11,9 @@ GitHub Actions.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v2.4.0-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v2.4.1-5eead4?style=flat-square)
 
-![Cove Compressor v2.4.0](docs/screenshot.png)
+![Cove Compressor v2.4.1](docs/screenshot.png)
 
 ---
 
