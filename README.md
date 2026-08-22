@@ -11,180 +11,88 @@ GitHub Actions.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v2.0.0-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v2.4.0-5eead4?style=flat-square)
 
-![Cove Compressor v2.0.0](docs/screenshot.png)
-
----
-
-## What's new in 2.3.0
-
-Two opt-in conversion options, both OFF by default so existing behaviour is
-unchanged until you turn them on.
-
-### Delete source after successful conversion
-
-A shared checkbox (Images and Videos) that removes the original file once its
-conversion finishes. Deletion is permanent and does not use the Trash. It only
-runs when the result is a real success: skipped, errored, cancelled, and
-timed-out files always keep their source, and so does any file whose subtitle
-preservation failed.
-
-### Extract English subtitles before conversion
-
-A Videos checkbox that rescues embedded English subtitle streams into sidecar
-files before the encode begins, since re-encoding drops them. Streams are
-matched on language tag first, then on an English title. Text subtitles become
-`.srt`, styled subtitles keep `.ass`, and anything else (bitmap subtitles
-included) is copied into a subtitle-only `.mks`.
-
-Sidecars are named `<output>.eng[.forced][.sdh].<ext>` next to the converted
-file. An existing file with that name is never overwritten: the new sidecar
-gets a numbered suffix instead. Videos with no English subtitles are a normal
-result, not an error. When both options are on, the source is deleted only
-after the converted video and its sidecars are safely in place.
-
-The run summary reports both, for example
-`Deleted originals: 1   Delete failures: 0` and
-`English subtitles extracted: 1   Subtitle preservation failures: 0`.
+![Cove Compressor v2.4.0](docs/screenshot.png)
 
 ---
 
-## What's new in 2.0
+## Features
 
-Cove Compressor 2.0 is a full redesign on top of the same compression core that
-drove every prior build. Every knob from 1.x is still there — nothing was
-simplified away.
+### Batch queue
 
-### Redesigned UI
+- Drop files or whole folders (scanned recursively), or use **Add files…** /
+  **Add folder…**. Remove rows with **✕** / **Delete**, wipe with **Clear**.
+- Real thumbnails in every row — Pillow for images (EXIF-rotation aware),
+  single-frame grabs via the bundled `ffmpeg` for videos, generated on
+  background threads with a concurrency cap.
+- Formats: images `avif bmp jpeg jpg png tif tiff webp`; videos
+  `avi flv m4v mkv mov mp4 webm wmv`.
 
-- **Frameless window** with a custom title bar matching the rest of the Cove
-  suite (skull badge, title, version pill, min/max/close). Double-click the
-  titlebar to maximize, drag anywhere on it to move, drag any edge to resize.
-- **Dark teal theme** — `Inter` body + `JetBrains Mono` for numeric labels.
-  Mint accent (`#5eead4`) on the Start button, progress bar, and selection
-  highlight.
-- **Two-column layout** — main column is the drop zone / file list / action
-  bar; side column is the Options card, privacy note, and Destination card.
+### Images
 
-### Drop zone + file queue
+- Preset — Light / Balanced / Aggressive
+- Output format — Keep original / Force JPEG / Force PNG / Force WebP / Force AVIF
+- Resize cap — No cap / 4000 / 2560 / 1920 / 1280 px (longest edge)
 
-- **Big visual drop zone** in the empty state, with supported-format chips
-  (`avif  bmp  jpeg  jpg  png  tif  tiff  webp` on the Images tab; `avi  flv
-  m4v  mkv  mov  mp4  webm  wmv` on Videos). Turns mint-bordered while dragging.
-- **Table-style queue** once populated — `FILE / SIZE / STATUS / ✕` columns,
-  toolbar on top with *N items · total size* plus **Add more…**, **Add folder…**,
-  and **Clear**.
-- **Drop files or whole folders** — folders are scanned recursively for
-  supported extensions.
-- **Real image / video thumbnails** in each row — 96×56 previews. Images are
-  thumbnailed via Pillow (respects EXIF rotation); videos are a single-frame
-  grab via the bundled `ffmpeg`. Cached per-path, generated on background
-  threads with a concurrency cap so a 50-file drop doesn't fork 50 ffmpegs.
-- **Multi-file / multi-folder queue** — drop several things in, remove
-  individual ones with **✕** or **Delete**, or wipe the whole list with **Clear**.
-- **Visible selection** — clicking a row highlights it with a mint border +
-  mint tint so it's obvious which row will respond to **Delete**.
+### Videos
 
-### Options (per tab)
-
-**Images:**
-- **Preset** — Light / Balanced / Aggressive
-- **Output format** — Keep original / Force JPEG / Force PNG / Force WebP /
-  Force AVIF
-- **Resize cap** — No cap / 4000 / 2560 / 1920 / 1280 px (longest edge)
-
-**Videos:**
-- **Method** — *Quality preset* (CRF), *Target file size* (MB, 2-pass), or
+- Method — *Quality preset* (CRF), *Target file size* (MB, 2-pass), or
   *Target reduction* (% smaller, 2-pass)
-- **Output format** — MP4 (H.265), MP4 (H.264), MKV (H.265), WebM (VP9)
-- **Encoder** — Automatic (GPU if available) / CPU (x264 / x265) /
-  NVIDIA GPU (NVENC) / AMD GPU (AMF). See
-  [Hardware acceleration](#hardware-acceleration-nvenc--amf).
-- **Resolution cap** — Original / 1080p / 720p / 480p
-- **Audio kbps** — 128 / 192 / 320
-- Quality presets: Web Small / Balanced / Archive Light (CRF values tuned per
-  codec — x265, x264, VP9 — plus matching NVENC `-cq` targets and AMF `-qp`
-  targets)
-- **Extract English subtitles before conversion** (default off) - pulls embedded
-  English subtitle streams to sidecar files before the encode
+- Output format — MP4 (H.265 / H.264), MKV (H.265), WebM (VP9)
+- Resolution cap — Original / 1080p / 720p / 480p · Audio — 128 / 192 / 320 kbps
 
-**Both tabs:**
-- **Delete source after successful conversion** (default off) - permanently
-  removes the original after a successful result, no Trash
+### Hardware acceleration
 
-### Hardware acceleration (NVENC / AMF)
-
-On machines with a supported GPU, Cove can offload H.264 / H.265 encoding to
-the card's dedicated hardware encoder for a large speed-up over the CPU (often
-several times faster), freeing the processor while a batch runs.
-
-- **NVIDIA GPUs** use the card's **NVENC** encoder (`hevc_nvenc` /
-  `h264_nvenc`); **AMD GPUs** use the **AMF** encoder (`hevc_amf` /
-  `h264_amf`). When both are present, NVENC is preferred on Automatic.
-- **Automatic** (default) uses NVENC when a working NVENC encoder is detected,
-  falls back to AMF when NVENC is unavailable but AMF is, and finally falls
-  back to the CPU (`libx265` / `libx264`) otherwise. Pick **CPU** to always
-  encode in software, **NVIDIA GPU (NVENC)** to force NVENC, or
-  **AMD GPU (AMF)** to force AMF.
-- Detection is a real one-frame test encode run once at launch per vendor —
-  the encoder being compiled into `ffmpeg` isn't enough, the GPU + driver have
-  to accept it. When no NVENC-capable GPU is found the *NVIDIA GPU* choice is
-  greyed out; the same applies to AMF and the *AMD GPU* choice.
-- **WebM (VP9)** has no NVENC or AMF equivalent, so it always encodes on the
-  CPU regardless of this setting.
-- Both GPU paths handle the *Target file size* / *Target reduction* modes with
-  their own single-pass VBR (a capped-bitrate approximation) rather than the
-  CPU's log-file two-pass; sizes land close to the target but aren't as exact
-  as the software two-pass. NVENC additionally uses internal `-multipass
-  fullres`; AMF does not. Quality presets map to NVENC `-cq` values on the
-  p1–p7 preset scale (`-tune hq`), and to AMF `-rc cqp -qp` targets with the
-  matching `-quality` dial (`speed` / `balanced` / `quality`) and
-  `-usage transcoding`. The log tags GPU-encoded files with `· GPU`.
-
-### Action bar
-
-- **Status line** — current file + stage (`pass 1/2`, `pass 2/2`, `encoding`,
-  `encoding · GPU` when NVENC is in use)
-- **Mint-glow progress bar** with live ETA
-- **Start / Cancel** swap in place — mid-batch cancellation terminates the
-  running ffmpeg cleanly
-- **Show log** disclosure — the log panel is hidden by default and expands
-  below on demand with **Copy** / **Clear** buttons
-
-### Completion banner
-
-After a batch finishes, a mint-bordered card appears at the top of the main
-column: `✓ Saved 1.2 GB (47%) · 12 images compressed`, with a one-click **Open
-output folder** button and a **✕** to dismiss. The banner auto-hides when you
-start the next batch.
+On GPUs that support it, H.264 / H.265 encodes offload to **NVIDIA NVENC** or
+**AMD AMF**, several times faster than the CPU. *Automatic* (default) probes
+each vendor with a real one-frame test encode at launch and falls back
+NVENC → AMF → CPU; unsupported choices grey out. WebM (VP9) has no GPU
+equivalent and always encodes on the CPU.
 
 ### Destination
 
-A single "Save to" field shared across tabs, a Browse button, and an **↗**
-shortcut that opens the folder in your OS file manager (inside the AppImage
-this strips `LD_LIBRARY_PATH` before spawning `xdg-open` so the bundle's libs
-don't poison the child process).
+- One **Save to** folder shared across tabs, with Browse and an **↗** shortcut
+  that opens it in your file manager.
+- **Save into each file's own folder** (default off) — writes every result next
+  to its original instead; recursive folder drops return to their own
+  subdirectories. The Save-to controls grey out while it's on, and name
+  collisions get numbered suffixes (`photo_1.webp`).
 
-**Save into each file's own folder** (default off) is an opt-in that writes
-every result next to its original instead of the shared Save-to folder — each
-file in a recursive folder drop returns to its own subdirectory. While it's on,
-the Save-to field, Browse, and ↗ controls grey out, and name collisions get
-numbered suffixes (`photo_1.webp`).
+### Opt-in conversion options (default off)
 
-### Other polish
+- **Delete source after successful conversion** — permanently removes each
+  original after a real success only: skipped, errored, cancelled, timed-out,
+  and subtitle-failed files always keep their source.
+- **Extract English subtitles before conversion** (Videos) — rescues embedded
+  English subtitle streams into sidecar files before the encode re-encodes
+  them away. Text subtitles become `.srt`, styled ones keep `.ass`, anything
+  else lands in a subtitle-only `.mks`, named
+  `<output>.eng[.forced][.sdh].<ext>` beside the converted video and never
+  overwriting an existing sidecar.
 
-- **Persistent settings** — last-used preset, format, encoder, resize cap,
-  video method values, audio bitrate, resolution cap, output folder, same-
-  folder output, log visibility, last tab, subtitle extraction, source
-  deletion, and window geometry all survive restarts via `QSettings`
+The run summary reports both options when active, e.g.
+`Deleted originals: 1   Delete failures: 0`.
+
+### Run feedback
+
+- Status line with per-file stage (`pass 1/2`, `encoding`, `encoding · GPU`),
+  mint progress bar with live ETA, Start/Cancel swap mid-batch.
+- Hidden-by-default log panel with **Copy** / **Clear**.
+- Completion banner — `✓ Saved 1.2 GB (47%) · 12 images compressed` — with a
+  one-click **Open output folder** button.
+
+### Everything else
+
+- **Frameless dark-teal UI** (Inter + JetBrains Mono, mint accent) with a
+  custom title bar: drag to move, double-click to maximize, drag edges to
+  resize.
+- **Persistent settings** — every option, the destination choices, log
+  visibility, last tab, and window geometry survive restarts via `QSettings`
   (`~/.config/Cove/Cove Compressor.conf` on Linux,
-   `HKCU\Software\Cove\Cove Compressor` on Windows).
-- **Auto-updater** — on launch a background thread checks GitHub Releases; when
-  a newer `v*` tag exists, a non-blocking prompt appears. On AppImage installs
-  the download-and-swap happens end-to-end (kernel keeps the running mmap alive
-  across overwrite, then re-execs). On Windows Setup / Portable / .deb the
-  release page opens and the user runs the installer themselves.
+  `HKCU\Software\Cove\Cove Compressor` on Windows).
+- **Auto-updater** — checks GitHub Releases on launch; AppImages download and
+  swap end-to-end, other installs open the release page.
 - **Metadata always stripped** — EXIF, GPS, camera info, and timestamps are
   dropped from every compressed image.
 
@@ -262,8 +170,8 @@ download `ffmpeg` automatically.
 ```bash
 bash scripts/build-release.sh
 # Output in release/:
-#   Cove-Compressor-2.0.0-x86_64.AppImage
-#   cove-compressor_2.0.0_amd64.deb
+#   Cove-Compressor-<version>-x86_64.AppImage
+#   cove-compressor_<version>_amd64.deb
 ```
 
 Flags:
@@ -277,10 +185,10 @@ Requires [Inno Setup 6](https://jrsoftware.org/isdl.php) (pre-installed on
 GitHub Actions' `windows-latest`).
 
 ```powershell
-.\build.ps1 -Version 2.0.0
+.\build.ps1 -Version <version>
 # Output in release\:
-#   cove-compressor-2.0.0-Setup.exe
-#   cove-compressor-2.0.0-Portable.exe
+#   cove-compressor-<version>-Setup.exe
+#   cove-compressor-<version>-Portable.exe
 ```
 
 #### Cross-build from Linux (Wine)
@@ -291,7 +199,7 @@ installed (the shared Cove build prefix), the Windows artifacts can be built
 without a Windows machine:
 
 ```bash
-VERSION=2.0.0 bash scripts/build-windows-wine.sh
+VERSION=<version> bash scripts/build-windows-wine.sh
 ```
 
 The script downloads the gyan.dev `ffmpeg` release-essentials build,
@@ -302,9 +210,9 @@ Linux artifacts.
 
 ### Automated release via GitHub Actions
 
-Push a tag matching `v*` (e.g. `v2.0.0`) and `.github/workflows/release.yml`
+Push a tag matching `v*` (e.g. `v2.4.0`) and `.github/workflows/release.yml`
 runs the Linux + Windows jobs in parallel and attaches all four artifacts to
-the GitHub Release created for the tag.
+a draft GitHub Release created for the tag.
 
 ---
 
