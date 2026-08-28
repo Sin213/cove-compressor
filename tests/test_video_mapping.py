@@ -269,17 +269,24 @@ def test_default_mp4_path_disables_subtitles_when_probe_fails(env, monkeypatch):
     assert "-sn" in fake.mux_cmd
 
 
-def test_mkv_keeps_implicit_selection(env, monkeypatch):
-    """MP4 policy must not leak into other containers."""
+def test_mkv_maps_explicitly_without_the_mp4_policy(env, monkeypatch):
+    """MP4's *policy* must not leak into MKV, even though MKV now maps too.
+
+    Both containers map explicitly and share the one subtitle probe, but they
+    do different things with it. Matroska names a single text subtitle by
+    absolute index and lets ffmpeg's default text encoder handle it; MP4 names
+    every compatible stream and transcodes to `mov_text`. The `mov_text`
+    codec argument is the part that must never appear here.
+    """
     src, out_dir, fake = env
     _probe(monkeypatch, [_sub(3, "subrip")])
 
     result = _run(src, out_dir, fmt="MKV (H.265)")
 
     assert result["status"] == "ok"
-    assert _maps(fake.mux_cmd) == []
+    assert _maps(fake.mux_cmd) == ["0:v:0", "0:a:0?", "0:3", "0:t?"]
     assert "-sn" not in fake.mux_cmd
-    assert "0:t?" not in _maps(fake.mux_cmd)
+    assert "mov_text" not in fake.mux_cmd
 
 
 def test_webm_keeps_implicit_selection(env, monkeypatch):
@@ -312,12 +319,17 @@ def test_probe_runs_once_for_mp4_with_extraction_off(env, monkeypatch):
     assert len(calls) == 1
 
 
-def test_non_mp4_without_extraction_adds_no_probe(env, monkeypatch):
+def test_implicitly_selected_container_adds_no_probe(env, monkeypatch):
+    """WebM still keeps ffmpeg's implicit selection, so it classifies nothing.
+
+    MKV no longer qualifies: it maps explicitly now and so must classify its
+    subtitle streams first (see `tests/test_mkv_attachments.py`).
+    """
     src, out_dir, _fake = env
     calls: list[Path] = []
     _probe(monkeypatch, [_sub(3, "subrip")], calls)
 
-    _run(src, out_dir, fmt="MKV (H.265)")
+    _run(src, out_dir, fmt="WebM (VP9)")
 
     assert calls == []
 
@@ -387,12 +399,16 @@ def test_b_two_pass_final_pass_still_gets_the_full_policy(env, monkeypatch):
     assert _pair(fake.mux_cmd, "-c:s", "mov_text")
 
 
-def test_b_mkv_pass1_is_unchanged(env, monkeypatch):
+def test_b_mkv_pass1_stays_video_only(env, monkeypatch):
+    """MKV maps explicitly now, so pass 1 names the video stream it analyses -
+    and still nothing else."""
     src, out_dir, fake = env
     _probe(monkeypatch, [])
     _run(src, out_dir, fmt="MKV (H.265)", mode="Target file size",
          mode_value=0.001)
-    assert _maps(fake.pass1_cmd) == []
+    assert _maps(fake.pass1_cmd) == ["0:v:0"]
+    assert "-an" in fake.pass1_cmd
+    assert "-c:t" not in fake.pass1_cmd
 
 
 # ══ GROUP C — faststart parity ═══════════════════════════════════════════════

@@ -642,8 +642,9 @@ def probe_subtitle_streams_once(input_path: Path
                                 ) -> tuple[list[dict] | None, str | None]:
     """The one subtitle discovery a video job is allowed to make.
 
-    Both consumers - sidecar extraction and the MP4 stream-mapping policy -
-    read the same result, so enabling one never costs a second ffprobe. On
+    Every consumer - sidecar extraction and the stream-mapping policy of each
+    explicitly mapped container (MP4, Matroska) - reads the same result, so
+    enabling one never costs a second ffprobe. On
     failure the stream list is None (never an empty list, which would read as
     "this file has no subtitles") alongside a description of what went wrong.
     """
@@ -727,9 +728,10 @@ def _prepare_english_subtitles(input_path: Path, output_path: Path,
 # codecs, attachments, data streams - is simply never named, which excludes it
 # without needing negative `-map -0:t` style filters.
 #
-# Other containers keep ffmpeg's implicit selection: Matroska and WebM can
-# carry what those sources contain, and widening their behaviour is not this
-# slice's job.
+# Matroska maps explicitly too, but for the opposite reason: it can carry
+# more than ffmpeg's automatic selection picks, and attachments are the part
+# worth naming (see `build_matroska_stream_map_args`). WebM keeps the implicit
+# selection - widening its behaviour is not this slice's job.
 
 # Text subtitle codecs MP4 can carry once transcoded to mov_text. Deliberately
 # the same vocabulary the sidecar path classifies against, so the two features
@@ -786,6 +788,69 @@ def build_mp4_stream_map_args(subtitle_streams: list[dict] | None) -> list:
     return args
 
 
+def matroska_mappable_subtitle_indexes(subtitle_streams: list[dict]) -> list[int]:
+    """Absolute indexes of the subtitle streams Matroska's encoder can reach.
+
+    Matroska's default subtitle codec is text-based, so the usable set is the
+    same text vocabulary MP4 classifies against - the difference between the
+    two containers is what they do with it, not what counts as text.
+    """
+    return mp4_mappable_subtitle_indexes(subtitle_streams)
+
+
+def build_matroska_stream_map_args(
+        subtitle_streams: list[dict] | None) -> list:
+    """Explicit Matroska stream selection for the muxing pass.
+
+    Matroska can carry attachments - embedded fonts and the like - and losing
+    them to a conversion is a fidelity bug. But ffmpeg turns its automatic
+    stream selection off entirely as soon as any `-map` appears, so asking for
+    attachments means naming everything else too. Each map below therefore has
+    to reproduce a decision automatic selection used to make for us.
+
+    The subtitle map is the subtle one. Automatic selection does not simply
+    take the first subtitle stream: it takes the first one whose *type* the
+    output's default subtitle encoder can produce, and quietly drops the rest.
+    Matroska's default encoder is text-based, so a bitmap track (PGS, VobSub,
+    DVB, XSUB) used to be skipped and the file converted anyway. Naming
+    `0:s:0?` instead would force that bitmap track into a text encoder and fail
+    the whole job, so the first *text* stream is named by absolute index and
+    nothing usable means `-sn`. `subtitle_streams` is None when discovery
+    failed, which disables subtitles outright rather than handing the choice
+    back to the implicit selection this policy exists to replace.
+
+    Audio and attachments stay optional: a silent source and a source with no
+    attachments must both still convert. That optionality is what makes
+    attachments free - `0:t?` needs no classification, so it needs no probe of
+    its own. Attachments are stream-copied because there is no such thing as
+    re-encoding one. Only `t` (attachment) is named; `d` (data) stays unmapped,
+    exactly as it is for MP4.
+    """
+    args = ["-map", "0:v:0", "-map", "0:a:0?"]
+    indexes = ([] if subtitle_streams is None
+               else matroska_mappable_subtitle_indexes(subtitle_streams))
+    if indexes:
+        args += ["-map", f"0:{indexes[0]}"]
+    else:
+        args += ["-sn"]
+    return args + ["-map", "0:t?", "-c:t", "copy"]
+
+
+def build_stream_map_args(muxer: str, subtitle_streams: list[dict] | None) -> list:
+    """The one place a container's stream-selection policy is decided.
+
+    Both the directly requested encode and the MP4 -> MKV fallback attempt come
+    through here, so the fallback inherits Matroska's attachment handling by
+    construction rather than by a second copy of the rule. WebM keeps ffmpeg's
+    implicit selection; widening it is not this slice's job.
+    """
+    if muxer == "mp4":
+        return build_mp4_stream_map_args(subtitle_streams)
+    if muxer == "matroska":
+        return build_matroska_stream_map_args(subtitle_streams)
+    return []
+
+
 def build_pass1_stream_map_args() -> list:
     """Two-pass pass 1 analyses video and nothing else.
 
@@ -794,6 +859,18 @@ def build_pass1_stream_map_args() -> list:
     output is a statistics log.
     """
     return ["-map", "0:v:0"]
+
+
+def build_pass1_map_args_for(muxer: str) -> list:
+    """Pass-1 maps for a container that maps explicitly at all.
+
+    A container that names its streams for the mux must name one for the
+    analysis pass too, or ffmpeg would be free to analyse a different video
+    stream than the one being encoded.
+    """
+    if muxer in ("mp4", "matroska"):
+        return build_pass1_stream_map_args()
+    return []
 
 
 def _brief(msg: str, limit: int = 120) -> str:
@@ -1404,20 +1481,26 @@ def compress_video(
         nvenc_preset = p["nvenc_preset"]
         amf_quality = p["amf_quality"]
 
-    # One subtitle discovery per file, shared by both consumers: the sidecar
-    # rescue feature and - for MP4 only - the explicit stream-mapping policy.
-    # Neither feature pays for the other, and enabling both costs one ffprobe.
-    needs_subtitle_probe = extract_english_subtitles or muxer == "mp4"
+    # One subtitle discovery per file, shared by every consumer: the sidecar
+    # rescue feature and the explicit stream-mapping policy of any container
+    # that has one. No feature pays for another, and enabling them all still
+    # costs exactly one ffprobe.
+    # Every explicitly mapped container needs it: MP4 to know what it can
+    # transcode to mov_text, Matroska to know which subtitle stream its
+    # text-based encoder can actually reach. Attachments add nothing here -
+    # `-map 0:t?` classifies nothing - so enabling them costs no probe.
+    needs_subtitle_probe = (extract_english_subtitles
+                            or muxer in ("mp4", "matroska"))
     sub_streams: list[dict] | None = None
     sub_probe_error: str | None = None
     if needs_subtitle_probe:
         sub_streams, sub_probe_error = probe_subtitle_streams_once(input_path)
 
-    # MP4 cannot carry everything a source might hold, so it gets explicit
-    # positive maps. Every other container keeps ffmpeg's implicit selection.
-    stream_map_args = (build_mp4_stream_map_args(sub_streams)
-                       if muxer == "mp4" else [])
-    pass1_map_args = build_pass1_stream_map_args() if muxer == "mp4" else []
+    # Containers that cannot (MP4) or should not (Matroska, which would
+    # otherwise drop attachments) leave selection to ffmpeg get explicit
+    # positive maps. WebM keeps ffmpeg's implicit selection.
+    stream_map_args = build_stream_map_args(muxer, sub_streams)
+    pass1_map_args = build_pass1_map_args_for(muxer)
 
     # Claim the destination atomically now that the job is certain to encode.
     # `reserve_output` creates the file with O_CREAT|O_EXCL, so a concurrent
@@ -1500,11 +1583,16 @@ def compress_video(
                     _retarget_subtitle_sidecars(
                         sub_pending, mp4_stem, output_path.stem)
                     # Same H.265 encoder and rate control; only the container
-                    # changes. MKV takes ffmpeg's implicit stream selection,
-                    # which is why it can carry what MP4 refused.
-                    result = _attempt(output_path, tmp_path, fb["muxer"],
-                                      fb["container_flags"], fb["audio"],
-                                      [], [])
+                    # changes. The retry goes through the same policy seam as
+                    # any other job, so it carries what MP4 refused - including
+                    # attachments - without a second copy of the rule. No new
+                    # probe: the already-discovered `sub_streams` is all the
+                    # policy ever consults.
+                    result = _attempt(
+                        output_path, tmp_path, fb["muxer"],
+                        fb["container_flags"], fb["audio"],
+                        build_stream_map_args(fb["muxer"], sub_streams),
+                        build_pass1_map_args_for(fb["muxer"]))
                     # True means "a fallback attempt happened", not "it
                     # worked" - the status field remains the verdict.
                     result["fallback_used"] = True
@@ -1537,9 +1625,10 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
 
     Split out so subtitle temp cleanup and output-reservation cleanup each get
     one honest `finally` around every exit path in the caller. `stream_map_args`
-    is the container's stream-selection policy (empty for everything but MP4)
-    and `pass1_map_args` the video-only variant for two-pass analysis; encoder,
-    rate-control and container settings are otherwise untouched.
+    is the container's stream-selection policy (empty only where ffmpeg's
+    implicit selection is kept) and `pass1_map_args` the video-only variant for
+    two-pass analysis; encoder, rate-control and container settings are
+    otherwise untouched.
     """
     vf = build_scale_filter(resolution_cap) if resolution_cap else None
     ffmpeg_base = [FFMPEG_BIN, "-nostdin", "-hide_banner", "-y"]

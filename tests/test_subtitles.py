@@ -122,9 +122,14 @@ def _run(src, out_dir, **kw):
         None, "192", threading.Event(), **kw)
 
 
-# ── Group 1 - setting OFF performs zero probes ──────────────────────────────
+# ── Group 1 - setting OFF performs zero extraction ──────────────────────────
+#
+# These run as MKV, which maps its streams explicitly and so classifies
+# subtitles once for that purpose alone (see `tests/test_mkv_attachments.py`).
+# What must stay at zero with the setting off is the *extraction* work: no
+# sidecar invocation, no sidecar keys, no `subtitles_failed`.
 
-def test_default_argument_never_probes(video_env, monkeypatch):
+def test_default_argument_never_extracts(video_env, monkeypatch):
     src, out_dir, fake = video_env
     calls: list[Path] = []
     _probe(monkeypatch, [_stream(2, language="eng")], calls)
@@ -132,13 +137,13 @@ def test_default_argument_never_probes(video_env, monkeypatch):
     result = _run(src, out_dir)
 
     assert result["status"] == "ok"
-    assert calls == []
+    assert len(calls) == 1          # the mapping probe, never a second one
     assert fake.subtitle_cmds == []
     assert "subtitles_extracted" not in result
     assert not result.get("subtitles_failed")
 
 
-def test_explicit_false_never_probes(video_env, monkeypatch):
+def test_explicit_false_never_extracts(video_env, monkeypatch):
     src, out_dir, fake = video_env
     calls: list[Path] = []
     _probe(monkeypatch, [_stream(2, language="eng")], calls)
@@ -146,7 +151,7 @@ def test_explicit_false_never_probes(video_env, monkeypatch):
     result = _run(src, out_dir, extract_english_subtitles=False)
 
     assert result["status"] == "ok"
-    assert calls == []
+    assert len(calls) == 1
     assert fake.subtitle_cmds == []
 
 
@@ -665,7 +670,7 @@ def test_subtitles_off_with_delete_on_is_unchanged(video_env, monkeypatch):
     result = _run(src, out_dir)
     delete_source_if_eligible(result, enabled=True)
 
-    assert calls == []
+    assert len(calls) == 1          # mapping only; extraction stayed off
     assert fake.subtitle_cmds == []
     assert result["source_deleted"] is True
     assert not src.exists()
