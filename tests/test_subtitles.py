@@ -52,8 +52,16 @@ def _has_pair(cmd, a, b) -> bool:
 
 class FakeFfmpeg:
     """Stands in for `run_ffmpeg`. Subtitle extraction invocations are the ones
-    carrying `-map`; everything else is a video encode. Both write their output
-    file, exactly like the real thing, so callers see a success *shape*."""
+    that strip both other stream kinds — `-vn` *and* `-an` together, which is
+    the shape only `build_subtitle_extract_cmd` produces. Everything else is a
+    video encode. (`-map` alone is not a discriminator: normal MP4 encodes now
+    carry explicit stream maps too, and two-pass pass 1 carries `-an`.) Both
+    write their output file, exactly like the real thing, so callers see a
+    success *shape*."""
+
+    @staticmethod
+    def _is_subtitle_extraction(cmd) -> bool:
+        return "-vn" in cmd and "-an" in cmd and "-map" in cmd
 
     def __init__(self, encode_bytes=b"v" * 10, sub_bytes=b"1\nhello\n",
                  sub_rc=0, encode_rc=0, sub_rc_by_index=None,
@@ -70,7 +78,7 @@ class FakeFfmpeg:
     def __call__(self, cmd, cancel_flag, duration=None,
                  on_progress=None, on_start=None):
         out = Path(cmd[-1])
-        if "-map" in cmd:
+        if self._is_subtitle_extraction(cmd):
             self.subtitle_cmds.append(list(cmd))
             idx = cmd[cmd.index("-map") + 1].split(":")[-1]
             rc = self.sub_rc_by_index.get(int(idx), self.sub_rc)

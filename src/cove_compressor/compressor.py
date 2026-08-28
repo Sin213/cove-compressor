@@ -44,6 +44,14 @@ except AttributeError:
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp", ".tiff", ".tif"}
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".wmv", ".flv"}
 ENCODE_STALL_TIMEOUT = 120  # Seconds without encoding progress.
+# `-movflags +faststart` rewrites the finished MP4 to move the moov atom to the
+# front. That phase emits no `time=` progress and scales with file size, so it
+# gets its own, longer allowance — entered only once ffmpeg says it has begun.
+FINALIZE_STALL_TIMEOUT = 600  # Seconds without progress while finalizing.
+# Removing a reserved output stub can lose a race with a transient Windows
+# file lock. Bounded so a failed job still returns promptly (~200ms worst case).
+RESERVED_CLEANUP_ATTEMPTS = 5
+RESERVED_CLEANUP_RETRY_DELAY = 0.05
 
 DEFAULT_OUTPUT = str(Path.home() / "Downloads" / "cove-compressed")
 
@@ -393,6 +401,20 @@ def ffprobe_duration(path: Path) -> float | None:
 
 _TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
 
+# ffmpeg announces the faststart rewrite as e.g. "Starting second pass: moving
+# the moov atom to the beginning of the file".
+_MOOV_RE = re.compile(r"moving the moov atom", re.IGNORECASE)
+
+
+def is_moov_relocation_line(line: str) -> bool:
+    """True when ffmpeg says it has started relocating the moov atom.
+
+    This marks the *start* of finalization, never its completion: it says the
+    rewrite is under way, so the watchdog should stop expecting `time=` lines.
+    It is deliberately not treated as progress, completion, or success.
+    """
+    return bool(_MOOV_RE.search(line or ""))
+
 
 def parse_ffmpeg_time(line: str) -> float | None:
     m = _TIME_RE.search(line)
@@ -616,11 +638,31 @@ def build_subtitle_extract_cmd(input_path: Path, stream_index: int,
             + codec_args + ["-f", muxer, str(out_path)])
 
 
+def probe_subtitle_streams_once(input_path: Path
+                                ) -> tuple[list[dict] | None, str | None]:
+    """The one subtitle discovery a video job is allowed to make.
+
+    Both consumers - sidecar extraction and the MP4 stream-mapping policy -
+    read the same result, so enabling one never costs a second ffprobe. On
+    failure the stream list is None (never an empty list, which would read as
+    "this file has no subtitles") alongside a description of what went wrong.
+    """
+    try:
+        return ffprobe_subtitle_streams(input_path), None
+    except SubtitleProbeError as e:
+        return None, str(e)
+
+
 def _prepare_english_subtitles(input_path: Path, output_path: Path,
                                output_dir: Path,
-                               cancel_flag: threading.Event
+                               cancel_flag: threading.Event,
+                               streams: list[dict] | None,
+                               probe_error: str | None
                                ) -> tuple[list[dict], list[str], Path | None]:
     """Extract every English subtitle stream into throwaway temp files.
+
+    `streams` / `probe_error` come from `probe_subtitle_streams_once`; this
+    function no longer probes, so the MP4 mapping policy can share the answer.
 
     Returns (pending, errors, temp_dir). `pending` entries are
     {"temp": Path, "dest": Path} pairs awaiting finalization; `temp_dir` is
@@ -629,11 +671,9 @@ def _prepare_english_subtitles(input_path: Path, output_path: Path,
     pending: list[dict] = []
     errors: list[str] = []
 
-    try:
-        streams = ffprobe_subtitle_streams(input_path)
-    except SubtitleProbeError as e:
+    if streams is None:
         # Explicitly not "there were no subtitles" - fail closed.
-        return pending, [f"subtitle probe failed: {e}"], None
+        return pending, [f"subtitle probe failed: {probe_error}"], None
 
     english = [s for s in streams if is_english_subtitle_stream(s)]
     if not english:
@@ -674,6 +714,86 @@ def _prepare_english_subtitles(input_path: Path, output_path: Path,
         pending.append({"temp": temp, "dest": dest})
 
     return pending, errors, temp_dir
+
+
+# ── MP4 stream selection policy ──────────────────────────────────────────────
+#
+# MP4 is the one container Cove targets that cannot carry everything a source
+# might hold. Left to its own devices ffmpeg picks streams implicitly, which
+# turns a PGS/VobSub track or a font attachment in the input into a hard mux
+# failure at the very end of a long encode. So MP4 gets explicit positive maps
+# instead: first video, first audio if there is one, and only subtitle streams
+# that can actually become mov_text. Anything else - bitmap subtitles, unknown
+# codecs, attachments, data streams - is simply never named, which excludes it
+# without needing negative `-map -0:t` style filters.
+#
+# Other containers keep ffmpeg's implicit selection: Matroska and WebM can
+# carry what those sources contain, and widening their behaviour is not this
+# slice's job.
+
+# Text subtitle codecs MP4 can carry once transcoded to mov_text. Deliberately
+# the same vocabulary the sidecar path classifies against, so the two features
+# can never disagree about what "text subtitle" means.
+MP4_TEXT_SUBTITLE_CODECS = SRT_SAFE_SUBTITLE_CODECS | ASS_SUBTITLE_CODECS
+
+
+def mp4_subtitle_codec_is_compatible(codec_name: str | None) -> bool:
+    """True only for codecs Cove knows it can transcode to mov_text."""
+    return (codec_name or "").strip().lower() in MP4_TEXT_SUBTITLE_CODECS
+
+
+def mp4_mappable_subtitle_indexes(subtitle_streams: list[dict]) -> list[int]:
+    """Absolute ffprobe indexes of the subtitle streams MP4 may carry.
+
+    Absolute file indexes, never subtitle-relative ones: excluding a bitmap
+    track must not renumber the text track that follows it. Anything without a
+    usable plain-int index is dropped rather than guessed at.
+    """
+    out: list[int] = []
+    for s in subtitle_streams:
+        if not isinstance(s, dict):
+            continue
+        idx = s.get("index")
+        # bool is an int subclass; only a plain non-negative int can be mapped.
+        if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+            continue
+        if mp4_subtitle_codec_is_compatible(s.get("codec_name")):
+            out.append(idx)
+    return out
+
+
+def build_mp4_stream_map_args(subtitle_streams: list[dict] | None) -> list:
+    """Explicit MP4 stream selection for the muxing pass.
+
+    `subtitle_streams` is the probed stream list, or None when discovery
+    failed - in which case subtitles are disabled outright rather than handed
+    back to ffmpeg's automatic selection, which is exactly the behaviour this
+    policy exists to replace.
+
+    Audio is mapped with a trailing `?`: a source with no audio track must
+    still convert, so the mapping is optional rather than mandatory.
+    """
+    args = ["-map", "0:v:0", "-map", "0:a:0?"]
+    indexes = ([] if subtitle_streams is None
+               else mp4_mappable_subtitle_indexes(subtitle_streams))
+    for idx in indexes:
+        args += ["-map", f"0:{idx}"]
+    if indexes:
+        args += ["-c:s", "mov_text"]
+    else:
+        # Nothing safe to carry - say so, so ffmpeg cannot pick something.
+        args += ["-sn"]
+    return args
+
+
+def build_pass1_stream_map_args() -> list:
+    """Two-pass pass 1 analyses video and nothing else.
+
+    It writes to the null muxer, so it is not a mux at all; giving it subtitle
+    or attachment maps would only invent failure modes for a pass whose entire
+    output is a statistics log.
+    """
+    return ["-map", "0:v:0"]
 
 
 def _brief(msg: str, limit: int = 120) -> str:
@@ -950,18 +1070,20 @@ def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
     last_progress = time.monotonic()
     started = False
     eof_received = False
+    # Set once ffmpeg reports the moov relocation; swaps the stall allowance
+    # for the longer finalization one. Never a completion signal.
+    finalizing = False
 
     while True:
         if cancel_flag.is_set():
             _stop_process()
             return -2, "cancelled"
 
-        if time.monotonic() - last_progress > ENCODE_STALL_TIMEOUT:
+        allowance = FINALIZE_STALL_TIMEOUT if finalizing else ENCODE_STALL_TIMEOUT
+        if time.monotonic() - last_progress > allowance:
             _stop_process()
-            return (
-                -3,
-                f"no encoding progress for {ENCODE_STALL_TIMEOUT}s (skipped)",
-            )
+            phase = "finalizing" if finalizing else "encoding"
+            return -3, f"no {phase} progress for {allowance}s (skipped)"
 
         try:
             line = stderr_queue.get(timeout=1.0)
@@ -981,6 +1103,13 @@ def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
                         on_start()
                 if duration and duration > 0 and on_progress:
                     on_progress(min(progress_time / duration * 100, 100.0))
+            elif is_moov_relocation_line(line):
+                # The file is being rewritten, not finished. Give the watchdog
+                # something recent to measure from and widen its allowance —
+                # but report no progress and claim no success. Only ffmpeg's
+                # real exit status ends this job.
+                last_progress = time.monotonic()
+                finalizing = True
 
         if eof_received and proc.poll() is not None:
             break
@@ -1077,6 +1206,44 @@ def build_video_encoder_args(
     return a
 
 
+def _discard_reserved_output(output_path: Path) -> None:
+    """Remove a reservation the job never filled.
+
+    Only the empty placeholder `reserve_output` created is ever removed - a
+    non-empty file at that path is somebody's real output (or a finished
+    encode) and is left strictly alone.
+
+    Windows routinely holds a brief handle on a file that was just created -
+    search indexers and AV scanners are the usual culprits - so the first
+    unlink can fail on a stub that becomes deletable milliseconds later. The
+    emptiness check is therefore re-taken before *every* attempt: during a
+    retry delay some other writer could have filled this path in, and deleting
+    that would destroy real data. stat-then-unlink is still not atomic, but
+    re-checking closes the whole retry window rather than leaving it open.
+
+    Giving up quietly is deliberate: this runs in a `finally` after ffmpeg has
+    already exited, and raising would replace the job's real error/timeout/
+    cancelled result with an unrelated OSError.
+    """
+    for attempt in range(RESERVED_CLEANUP_ATTEMPTS):
+        try:
+            st = os.stat(output_path)
+        except OSError:
+            return
+        if not stat_mod.S_ISREG(st.st_mode) or st.st_size != 0:
+            # Gone, replaced, or filled in by somebody else - not our stub.
+            return
+        try:
+            os.unlink(output_path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == RESERVED_CLEANUP_ATTEMPTS - 1:
+                return
+            time.sleep(RESERVED_CLEANUP_RETRY_DELAY)
+
+
 def compress_video(
     input_path: Path,
     output_dir: Path,
@@ -1136,9 +1303,6 @@ def compress_video(
         quality_key = codec_key
 
     original_size = input_path.stat().st_size
-    output_path = unique_path(output_dir / f"{input_path.stem}{out_ext}")
-    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-
     duration = ffprobe_duration(input_path)
 
     use_two_pass = False
@@ -1175,54 +1339,94 @@ def compress_video(
         nvenc_preset = p["nvenc_preset"]
         amf_quality = p["amf_quality"]
 
+    # One subtitle discovery per file, shared by both consumers: the sidecar
+    # rescue feature and - for MP4 only - the explicit stream-mapping policy.
+    # Neither feature pays for the other, and enabling both costs one ffprobe.
+    needs_subtitle_probe = extract_english_subtitles or muxer == "mp4"
+    sub_streams: list[dict] | None = None
+    sub_probe_error: str | None = None
+    if needs_subtitle_probe:
+        sub_streams, sub_probe_error = probe_subtitle_streams_once(input_path)
+
+    # MP4 cannot carry everything a source might hold, so it gets explicit
+    # positive maps. Every other container keeps ffmpeg's implicit selection.
+    stream_map_args = (build_mp4_stream_map_args(sub_streams)
+                       if muxer == "mp4" else [])
+    pass1_map_args = build_pass1_stream_map_args() if muxer == "mp4" else []
+
+    # Claim the destination atomically now that the job is certain to encode.
+    # `reserve_output` creates the file with O_CREAT|O_EXCL, so a concurrent
+    # job - or a pre-existing file - can never end up sharing this name. The
+    # placeholder is zero bytes and belongs to Cove until the encode replaces
+    # it; every non-success exit below removes it again.
+    output_path, tmp_path = reserve_output(
+        output_dir / f"{input_path.stem}{out_ext}")
+
     # Subtitle rescue runs here: after the deterministic pre-encode skips
     # above (no point extracting for a job that never encodes) and before the
     # first real encode invocation below.
     sub_pending: list[dict] = []
     sub_errors: list[str] = []
     sub_temp_dir: Path | None = None
-    if extract_english_subtitles:
-        sub_pending, sub_errors, sub_temp_dir = _prepare_english_subtitles(
-            input_path, output_path, output_dir, cancel_flag)
-        if cancel_flag.is_set():
+    result: dict | None = None
+    try:
+        try:
+            if extract_english_subtitles:
+                sub_pending, sub_errors, sub_temp_dir = \
+                    _prepare_english_subtitles(
+                        input_path, output_path, output_dir, cancel_flag,
+                        sub_streams, sub_probe_error)
+                if cancel_flag.is_set():
+                    result = {"file": input_path, "status": "error",
+                              "msg": "cancelled"}
+            if result is None:
+                result = _encode_video(
+                    input_path=input_path, output_path=output_path,
+                    tmp_path=tmp_path,
+                    original_size=original_size, duration=duration, mode=mode,
+                    encoder=encoder, audio_enc=audio_enc,
+                    audio_kbps=audio_kbps,
+                    muxer=muxer, container_flags=container_flags,
+                    stream_map_args=stream_map_args,
+                    pass1_map_args=pass1_map_args,
+                    resolution_cap=resolution_cap, use_two_pass=use_two_pass,
+                    video_kbps=video_kbps, crf=crf, speed_preset=speed_preset,
+                    nvenc_preset=nvenc_preset, amf_quality=amf_quality,
+                    use_hw=(use_nvenc or use_amf), cancel_flag=cancel_flag,
+                    progress_cb=progress_cb, on_start=on_start,
+                    extract_english_subtitles=extract_english_subtitles,
+                    sub_pending=sub_pending, sub_errors=sub_errors,
+                )
+        finally:
+            # Temps are throwaway either way: finalization moves the keepers
+            # out first, and a failed/skipped/cancelled job leaves nothing.
             if sub_temp_dir is not None:
                 shutil.rmtree(sub_temp_dir, ignore_errors=True)
-            return {"file": input_path, "status": "error", "msg": "cancelled"}
-
-    try:
-        return _encode_video(
-            input_path=input_path, output_path=output_path, tmp_path=tmp_path,
-            original_size=original_size, duration=duration, mode=mode,
-            encoder=encoder, audio_enc=audio_enc, audio_kbps=audio_kbps,
-            muxer=muxer, container_flags=container_flags,
-            resolution_cap=resolution_cap, use_two_pass=use_two_pass,
-            video_kbps=video_kbps, crf=crf, speed_preset=speed_preset,
-            nvenc_preset=nvenc_preset, amf_quality=amf_quality,
-            use_hw=(use_nvenc or use_amf), cancel_flag=cancel_flag,
-            progress_cb=progress_cb, on_start=on_start,
-            extract_english_subtitles=extract_english_subtitles,
-            sub_pending=sub_pending, sub_errors=sub_errors,
-        )
     finally:
-        # Temps are throwaway either way: finalization moves the keepers out
-        # first, and a failed/skipped/cancelled job leaves nothing behind.
-        if sub_temp_dir is not None:
-            shutil.rmtree(sub_temp_dir, ignore_errors=True)
+        # Error, timeout, cancellation, skip, or an exception on the way out:
+        # anything short of a finished video leaves no reserved stub behind.
+        if result is None or result.get("status") != "ok":
+            _discard_reserved_output(output_path)
+    return result
 
 
 def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
                   original_size: int, duration, mode: str, encoder: str,
                   audio_enc: str, audio_kbps, muxer: str,
-                  container_flags: list, resolution_cap, use_two_pass: bool,
+                  container_flags: list, stream_map_args: list,
+                  pass1_map_args: list, resolution_cap, use_two_pass: bool,
                   video_kbps, crf, speed_preset: str, nvenc_preset: str,
                   amf_quality: str, use_hw: bool,
                   cancel_flag: threading.Event, progress_cb, on_start,
                   extract_english_subtitles: bool,
                   sub_pending: list, sub_errors: list) -> dict:
-    """The unchanged encode + finalize half of `compress_video`.
+    """The encode + finalize half of `compress_video`.
 
-    Split out only so subtitle temp cleanup gets one honest `finally` around
-    every exit path; the ffmpeg command construction below is untouched.
+    Split out so subtitle temp cleanup and output-reservation cleanup each get
+    one honest `finally` around every exit path in the caller. `stream_map_args`
+    is the container's stream-selection policy (empty for everything but MP4)
+    and `pass1_map_args` the video-only variant for two-pass analysis; encoder,
+    rate-control and container settings are otherwise untouched.
     """
     vf = build_scale_filter(resolution_cap) if resolution_cap else None
     ffmpeg_base = [FFMPEG_BIN, "-nostdin", "-hide_banner", "-y"]
@@ -1248,7 +1452,7 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
 
         if use_two_pass:
             rc, err = run_ffmpeg(
-                ffmpeg_base + common_in + vargs(1) + [
+                ffmpeg_base + common_in + pass1_map_args + vargs(1) + [
                     "-passlogfile", passlog, "-an", "-f", "null", os.devnull],
                 cancel_flag,
                 duration=duration,
@@ -1266,7 +1470,7 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
                         "msg": f"pass 1 failed: {err}"}
 
             rc, err = run_ffmpeg(
-                ffmpeg_base + common_in + vargs(2) + [
+                ffmpeg_base + common_in + stream_map_args + vargs(2) + [
                     "-passlogfile", passlog,
                     "-c:a", audio_enc, "-b:a", f"{audio_kbps}k",
                 ] + container_flags + ["-f", muxer, str(tmp_path)],
@@ -1276,7 +1480,7 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
                 on_start=on_start)
         else:
             rc, err = run_ffmpeg(
-                ffmpeg_base + common_in + vargs(None) + [
+                ffmpeg_base + common_in + stream_map_args + vargs(None) + [
                     "-c:a", audio_enc, "-b:a", f"{audio_kbps}k",
                 ] + container_flags + ["-f", muxer, str(tmp_path)],
                 cancel_flag,
@@ -1309,7 +1513,9 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
                 "original": original_size, "new": original_size,
                 "msg": "compression would increase size (try Target reduction mode)"}
 
-    tmp_path.rename(output_path)
+    # `os.replace`, not `rename`: the destination is the zero-byte placeholder
+    # this job reserved, and on Windows `rename` refuses an existing target.
+    os.replace(str(tmp_path), str(output_path))
     result = {"file": input_path, "output": output_path, "status": "ok",
               "original": original_size, "new": new_size, "encoder": encoder}
     # Sidecars are finalized only now, against a video output that exists.
