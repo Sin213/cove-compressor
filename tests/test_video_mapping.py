@@ -634,7 +634,12 @@ def test_e4_placeholder_cleanup_rechecks_emptiness_between_retries(
     must not be deleted by the next attempt."""
     src, out_dir, fake = env
     _probe(monkeypatch, [])
-    fake.encode_rc = 1
+    # -1 (ffmpeg unavailable), not a positive exit: this test asserts that the
+    # *only* unlink in the job is the MP4 placeholder's, and a positive exit
+    # now earns an MKV fallback attempt that legitimately reserves - and then
+    # discards - a second stub. The cleanup semantics under test are identical
+    # either way; the failure class is chosen to keep the job single-container.
+    fake.encode_rc = -1
     target = out_dir / "Movie.mp4"
     attempts: list[int] = []
 

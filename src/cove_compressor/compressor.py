@@ -1244,6 +1244,71 @@ def _discard_reserved_output(output_path: Path) -> None:
             time.sleep(RESERVED_CLEANUP_RETRY_DELAY)
 
 
+# ── MP4 → MKV container fallback ─────────────────────────────────────────────
+#
+# MP4 is the one container Cove targets that can refuse a stream combination
+# outright, and it does so at the very end of the job. Tab 2a removed the
+# predictable causes with explicit stream maps, but a final mux/trailer failure
+# is still possible - and for the user it is a dead end: a long encode that
+# produced nothing. Matroska carries everything MP4 can, so one retry into MKV
+# turns that dead end into a usable file.
+#
+# The retry is deliberately minimal: one requested format, one failure class,
+# one extra attempt, and no state that outlives the `compress_video` call. The
+# next file starts as MP4 again because nothing here is remembered anywhere.
+
+MKV_FALLBACK_SOURCE_FORMAT = "MP4 (H.265)"
+MKV_FALLBACK_TARGET_FORMAT = "MKV (H.265)"
+
+# Canonical no-space signals, deliberately two exact phrases rather than an
+# error taxonomy. A full disk is not a container problem: retrying into another
+# container on the same filesystem cannot succeed and only enlarges the mess.
+NO_SPACE_SIGNALS = ("no space left on device", "enospc")
+
+
+def _is_no_space_failure(msg: str | None) -> bool:
+    text = (msg or "").lower()
+    return any(signal in text for signal in NO_SPACE_SIGNALS)
+
+
+def _mkv_fallback_eligible(video_format_key: str, result: dict,
+                           cancel_flag: threading.Event) -> bool:
+    """Whether this one failed attempt has earned its single MKV retry.
+
+    Everything else is terminal. `mux_failed` is what narrows this to an
+    ordinary positive ffmpeg exit from the final encode/mux invocation, so
+    cancellation, stalls, a missing ffmpeg, pass-1 failures, pre-encode
+    validation, reservation failures and skips can never reach here. The
+    cancel flag is re-read because a terminated ffmpeg often exits positive:
+    the user's intent outranks the exit code.
+    """
+    return (
+        video_format_key == MKV_FALLBACK_SOURCE_FORMAT
+        and not cancel_flag.is_set()
+        and result.get("status") == "error"
+        and bool(result.get("mux_failed"))
+        and not _is_no_space_failure(result.get("msg"))
+    )
+
+
+def _retarget_subtitle_sidecars(pending: list[dict], old_stem: str,
+                                new_stem: str) -> None:
+    """Re-aim not-yet-finalized sidecars at the container that actually lands.
+
+    Extraction happened once, before the first attempt, against the MP4
+    destination's stem. A fallback usually keeps that stem (`Movie.mp4` →
+    `Movie.mkv`) but a collision can bump it, and a sidecar only works when it
+    sits beside the video it names. This renames destinations only - no
+    re-probe, no re-extraction, no second subtitle lifecycle.
+    """
+    if old_stem == new_stem:
+        return
+    for item in pending:
+        dest = Path(item["dest"])
+        if dest.name.startswith(old_stem):
+            item["dest"] = dest.with_name(new_stem + dest.name[len(old_stem):])
+
+
 def compress_video(
     input_path: Path,
     output_dir: Path,
@@ -1369,6 +1434,28 @@ def compress_video(
     sub_errors: list[str] = []
     sub_temp_dir: Path | None = None
     result: dict | None = None
+
+    def _attempt(out_path: Path, tmp: Path, attempt_muxer: str,
+                 attempt_flags: list, attempt_audio: str,
+                 attempt_maps: list, attempt_pass1_maps: list) -> dict:
+        """One encode of this file into one container. Never more than one."""
+        return _encode_video(
+            input_path=input_path, output_path=out_path, tmp_path=tmp,
+            original_size=original_size, duration=duration, mode=mode,
+            encoder=encoder, audio_enc=attempt_audio,
+            audio_kbps=audio_kbps,
+            muxer=attempt_muxer, container_flags=attempt_flags,
+            stream_map_args=attempt_maps,
+            pass1_map_args=attempt_pass1_maps,
+            resolution_cap=resolution_cap, use_two_pass=use_two_pass,
+            video_kbps=video_kbps, crf=crf, speed_preset=speed_preset,
+            nvenc_preset=nvenc_preset, amf_quality=amf_quality,
+            use_hw=(use_nvenc or use_amf), cancel_flag=cancel_flag,
+            progress_cb=progress_cb, on_start=on_start,
+            extract_english_subtitles=extract_english_subtitles,
+            sub_pending=sub_pending, sub_errors=sub_errors,
+        )
+
     try:
         try:
             if extract_english_subtitles:
@@ -1380,23 +1467,47 @@ def compress_video(
                     result = {"file": input_path, "status": "error",
                               "msg": "cancelled"}
             if result is None:
-                result = _encode_video(
-                    input_path=input_path, output_path=output_path,
-                    tmp_path=tmp_path,
-                    original_size=original_size, duration=duration, mode=mode,
-                    encoder=encoder, audio_enc=audio_enc,
-                    audio_kbps=audio_kbps,
-                    muxer=muxer, container_flags=container_flags,
-                    stream_map_args=stream_map_args,
-                    pass1_map_args=pass1_map_args,
-                    resolution_cap=resolution_cap, use_two_pass=use_two_pass,
-                    video_kbps=video_kbps, crf=crf, speed_preset=speed_preset,
-                    nvenc_preset=nvenc_preset, amf_quality=amf_quality,
-                    use_hw=(use_nvenc or use_amf), cancel_flag=cancel_flag,
-                    progress_cb=progress_cb, on_start=on_start,
-                    extract_english_subtitles=extract_english_subtitles,
-                    sub_pending=sub_pending, sub_errors=sub_errors,
-                )
+                result = _attempt(output_path, tmp_path, muxer,
+                                  container_flags, audio_enc,
+                                  stream_map_args, pass1_map_args)
+
+                # The single MP4 → MKV retry. It lives here, inside the
+                # subtitle temp lifecycle, so the second attempt reuses the
+                # subtitles the first one prepared; `_encode_video` itself
+                # stays a one-attempt primitive that knows nothing about it.
+                if _mkv_fallback_eligible(video_format_key, result,
+                                          cancel_flag):
+                    fb = VIDEO_FORMATS[MKV_FALLBACK_TARGET_FORMAT]
+                    # This temp belongs to this job alone (it is derived from
+                    # an exclusively reserved name), so deleting it outright is
+                    # safe - unlike the output placeholder below. `_encode_video`
+                    # normally removes it already; this covers the case where it
+                    # could not.
+                    if tmp_path.exists():
+                        try:
+                            tmp_path.unlink()
+                        except OSError:
+                            pass
+                    # Release only the stub this job still owns. The
+                    # emptiness-checked cleanup is what keeps this from
+                    # deleting a path another writer has since filled in.
+                    _discard_reserved_output(output_path)
+                    mp4_stem = output_path.stem
+                    # A fresh O_CREAT|O_EXCL claim: the MP4 name having been
+                    # free says nothing about the MKV name being free.
+                    output_path, tmp_path = reserve_output(
+                        output_dir / f"{input_path.stem}{fb['ext']}")
+                    _retarget_subtitle_sidecars(
+                        sub_pending, mp4_stem, output_path.stem)
+                    # Same H.265 encoder and rate control; only the container
+                    # changes. MKV takes ffmpeg's implicit stream selection,
+                    # which is why it can carry what MP4 refused.
+                    result = _attempt(output_path, tmp_path, fb["muxer"],
+                                      fb["container_flags"], fb["audio"],
+                                      [], [])
+                    # True means "a fallback attempt happened", not "it
+                    # worked" - the status field remains the verdict.
+                    result["fallback_used"] = True
         finally:
             # Temps are throwaway either way: finalization moves the keepers
             # out first, and a failed/skipped/cancelled job leaves nothing.
@@ -1407,6 +1518,8 @@ def compress_video(
         # anything short of a finished video leaves no reserved stub behind.
         if result is None or result.get("status") != "ok":
             _discard_reserved_output(output_path)
+    # Internal coordination only: callers see the outcome, not the mechanism.
+    result.pop("mux_failed", None)
     return result
 
 
@@ -1502,7 +1615,18 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
     if rc != 0:
         if tmp_path.exists():
             tmp_path.unlink()
-        return {"file": input_path, "status": "error", "msg": f"ffmpeg failed: {err}"}
+        result = {"file": input_path, "status": "error",
+                  "msg": f"ffmpeg failed: {err}"}
+        if rc > 0:
+            # An ordinary nonzero exit from the *final* encode/mux invocation
+            # - single-pass, or pass 2 of two-pass. At this layer an encoder
+            # failure and a container/trailer failure are indistinguishable,
+            # so the marker says only "this was the retryable invocation" and
+            # leaves the policy decision to `compress_video`. Negative codes
+            # are Cove's own (-1 launch, -2 cancel, -3 stall) and are never
+            # marked; neither is pass 1, which returns above.
+            result["mux_failed"] = True
+        return result
     if not tmp_path.exists():
         return {"file": input_path, "status": "error", "msg": "no output file produced"}
 
