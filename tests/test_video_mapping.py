@@ -118,11 +118,18 @@ def _pair(cmd, flag, value) -> bool:
                for i in range(len(cmd) - 1))
 
 
+# Big enough that the 1 MB targets below are a real reduction *and* leave a
+# usable video budget once the audio bitrate is reserved. A target that cannot
+# hold its audio is refused before encoding (see `tests/test_multi_audio.py`),
+# which is not the subject of any test in this file.
+SRC_BYTES = 4 * 1024 * 1024
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """A source file, an output dir, and a faked encoder stack."""
     src = tmp_path / "Movie.mkv"
-    src.write_bytes(b"s" * 4096)
+    src.write_bytes(b"s" * SRC_BYTES)
     out_dir = tmp_path / "out"
     out_dir.mkdir()
 
@@ -134,15 +141,16 @@ def env(tmp_path, monkeypatch):
     return src, out_dir, fake
 
 
-def _probe(monkeypatch, streams, calls=None):
-    """Fake `ffprobe_subtitle_streams`; `streams` may be an exception."""
+def _probe(monkeypatch, streams, calls=None, audio_count=1):
+    """Fake the shared stream inventory; `streams` may be an exception."""
     def fake(path):
         if calls is not None:
             calls.append(Path(path))
         if isinstance(streams, Exception):
             raise streams
-        return [dict(s) for s in streams]
-    monkeypatch.setattr(compressor, "ffprobe_subtitle_streams", fake)
+        return compressor.StreamInventory(
+            subtitles=[dict(s) for s in streams], audio_count=audio_count)
+    monkeypatch.setattr(compressor, "ffprobe_stream_inventory", fake)
 
 
 def _run(src, out_dir, fmt="MP4 (H.265)", mode="Quality preset",
@@ -160,12 +168,16 @@ def test_a1_video_stream_mapped_exactly_once():
     assert _maps(args).count("0:v:0") == 1
 
 
-def test_a2_first_audio_is_mapped_optionally():
-    """`0:a:0?` — the trailing `?` is what keeps silent video working."""
+def test_a2_audio_is_mapped_optionally():
+    """`0:a?` — the trailing `?` is what keeps silent video working.
+
+    Which audio streams that covers is `tests/test_multi_audio.py`'s subject;
+    what this asserts is that neither form is mandatory.
+    """
     maps = _maps(build_mp4_stream_map_args([]))
-    assert "0:a:0?" in maps
+    assert "0:a?" in maps
     assert "0:a:0" not in maps, "mandatory audio breaks sources with no audio"
-    assert "0:a" not in maps, "multi-audio preservation is out of scope"
+    assert "0:a" not in maps, "mandatory audio breaks sources with no audio"
 
 
 @pytest.mark.parametrize("codec", TEXT_CODECS)
@@ -179,13 +191,13 @@ def test_a3_safe_text_subtitles_map_by_absolute_index(codec):
 def test_a3_multiple_text_subtitles_keep_absolute_indexes():
     args = build_mp4_stream_map_args(
         [_sub(2, "subrip"), _sub(5, "ass"), _sub(9, "mov_text")])
-    assert _maps(args) == ["0:v:0", "0:a:0?", "0:2", "0:5", "0:9"]
+    assert _maps(args) == ["0:v:0", "0:a?", "0:2", "0:5", "0:9"]
 
 
 @pytest.mark.parametrize("codec", BITMAP_CODECS)
 def test_a4_bitmap_subtitles_are_never_mapped(codec):
     args = build_mp4_stream_map_args([_sub(2, codec)])
-    assert _maps(args) == ["0:v:0", "0:a:0?"]
+    assert _maps(args) == ["0:v:0", "0:a?"]
     assert "-sn" in args
     assert not _pair(args, "-c:s", "mov_text")
 
@@ -193,13 +205,13 @@ def test_a4_bitmap_subtitles_are_never_mapped(codec):
 def test_a4_bitmap_stream_does_not_shift_a_sibling_text_index():
     args = build_mp4_stream_map_args(
         [_sub(2, "hdmv_pgs_subtitle"), _sub(4, "subrip")])
-    assert _maps(args) == ["0:v:0", "0:a:0?", "0:4"]
+    assert _maps(args) == ["0:v:0", "0:a?", "0:4"]
 
 
 @pytest.mark.parametrize("codec", ["", None, "eia_608", "unknown_future_codec"])
 def test_a5_unknown_subtitle_codecs_fail_closed(codec):
     args = build_mp4_stream_map_args([_sub(1, codec)])
-    assert _maps(args) == ["0:v:0", "0:a:0?"]
+    assert _maps(args) == ["0:v:0", "0:a?"]
     assert "-sn" in args
 
 
@@ -209,7 +221,7 @@ def test_a5_unusable_stream_index_is_refused():
                 {"index": "2", "codec_name": "subrip"},
                 {"index": True, "codec_name": "subrip"},
                 {"index": -1, "codec_name": "subrip"}):
-        assert _maps(build_mp4_stream_map_args([bad])) == ["0:v:0", "0:a:0?"]
+        assert _maps(build_mp4_stream_map_args([bad])) == ["0:v:0", "0:a?"]
 
 
 def test_a6_attachments_and_data_are_never_positively_mapped():
@@ -223,14 +235,14 @@ def test_a6_attachments_and_data_are_never_positively_mapped():
 
 def test_a7_probe_failure_keeps_av_and_disables_subtitles():
     args = build_mp4_stream_map_args(None)
-    assert _maps(args) == ["0:v:0", "0:a:0?"]
+    assert _maps(args) == ["0:v:0", "0:a?"]
     assert "-sn" in args, "must not fall back to automatic subtitle selection"
     assert not _pair(args, "-c:s", "mov_text")
 
 
 def test_a8_no_subtitle_streams_is_not_an_error():
     args = build_mp4_stream_map_args([])
-    assert _maps(args) == ["0:v:0", "0:a:0?"]
+    assert _maps(args) == ["0:v:0", "0:a?"]
     assert "-sn" in args
 
 
@@ -254,7 +266,7 @@ def test_default_mp4_path_applies_the_mapping_policy(env, monkeypatch):
     result = _run(src, out_dir)
 
     assert result["status"] == "ok"
-    assert _maps(fake.mux_cmd) == ["0:v:0", "0:a:0?", "0:3"]
+    assert _maps(fake.mux_cmd) == ["0:v:0", "0:a?", "0:3"]
     assert _pair(fake.mux_cmd, "-c:s", "mov_text")
 
 
@@ -265,7 +277,7 @@ def test_default_mp4_path_disables_subtitles_when_probe_fails(env, monkeypatch):
     result = _run(src, out_dir)
 
     assert result["status"] == "ok"
-    assert _maps(fake.mux_cmd) == ["0:v:0", "0:a:0?"]
+    assert _maps(fake.mux_cmd) == ["0:v:0", "0:a?"]
     assert "-sn" in fake.mux_cmd
 
 
@@ -284,7 +296,7 @@ def test_mkv_maps_explicitly_without_the_mp4_policy(env, monkeypatch):
     result = _run(src, out_dir, fmt="MKV (H.265)")
 
     assert result["status"] == "ok"
-    assert _maps(fake.mux_cmd) == ["0:v:0", "0:a:0?", "0:3", "0:t?"]
+    assert _maps(fake.mux_cmd) == ["0:v:0", "0:a?", "0:3", "0:t?"]
     assert "-sn" not in fake.mux_cmd
     assert "mov_text" not in fake.mux_cmd
 
@@ -378,7 +390,7 @@ def test_b_two_pass_pass1_is_video_only(env, monkeypatch):
     src, out_dir, fake = env
     _probe(monkeypatch, [_sub(3, "subrip")])
 
-    result = _run(src, out_dir, mode="Target file size", mode_value=0.001)
+    result = _run(src, out_dir, mode="Target file size", mode_value=1)
 
     assert result["status"] == "ok"
     p1 = fake.pass1_cmd
@@ -393,9 +405,9 @@ def test_b_two_pass_final_pass_still_gets_the_full_policy(env, monkeypatch):
     src, out_dir, fake = env
     _probe(monkeypatch, [_sub(3, "subrip")])
 
-    _run(src, out_dir, mode="Target file size", mode_value=0.001)
+    _run(src, out_dir, mode="Target file size", mode_value=1)
 
-    assert _maps(fake.mux_cmd) == ["0:v:0", "0:a:0?", "0:3"]
+    assert _maps(fake.mux_cmd) == ["0:v:0", "0:a?", "0:3"]
     assert _pair(fake.mux_cmd, "-c:s", "mov_text")
 
 
@@ -405,7 +417,7 @@ def test_b_mkv_pass1_stays_video_only(env, monkeypatch):
     src, out_dir, fake = env
     _probe(monkeypatch, [])
     _run(src, out_dir, fmt="MKV (H.265)", mode="Target file size",
-         mode_value=0.001)
+         mode_value=1)
     assert _maps(fake.pass1_cmd) == ["0:v:0"]
     assert "-an" in fake.pass1_cmd
     assert "-c:t" not in fake.pass1_cmd
@@ -433,7 +445,7 @@ def test_c_non_mp4_never_gains_faststart(env, monkeypatch, fmt):
 def test_c_faststart_survives_the_two_pass_path(env, monkeypatch, fmt):
     src, out_dir, fake = env
     _probe(monkeypatch, [])
-    _run(src, out_dir, fmt=fmt, mode="Target file size", mode_value=0.001)
+    _run(src, out_dir, fmt=fmt, mode="Target file size", mode_value=1)
     assert _pair(fake.mux_cmd, "-movflags", "+faststart")
 
 
@@ -587,7 +599,7 @@ def test_e6_two_pass_timeout_in_pass1_leaves_no_placeholder(env, monkeypatch):
     _probe(monkeypatch, [])
     fake.encode_rc = -3
 
-    result = _run(src, out_dir, mode="Target file size", mode_value=0.001)
+    result = _run(src, out_dir, mode="Target file size", mode_value=1)
 
     assert result["status"] == "timeout"
     assert list(out_dir.iterdir()) == []
@@ -597,7 +609,7 @@ def test_e7_skipped_result_leaves_no_placeholder(env, monkeypatch):
     """Quality preset that would grow the file skips — and cleans up."""
     src, out_dir, fake = env
     _probe(monkeypatch, [])
-    fake.encode_bytes = b"x" * 9000  # larger than the 4096-byte source
+    fake.encode_bytes = b"x" * (SRC_BYTES + 1)  # larger than the source
 
     result = _run(src, out_dir)
 

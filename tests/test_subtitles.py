@@ -21,7 +21,7 @@ from cove_compressor.compressor import (  # noqa: E402
     build_subtitle_extract_cmd,
     compress_video,
     delete_source_if_eligible,
-    ffprobe_subtitle_streams,
+    ffprobe_stream_inventory,
     is_english_subtitle_stream,
     subtitle_sidecar_name,
     subtitle_sidecar_target,
@@ -107,12 +107,14 @@ def video_env(tmp_path, monkeypatch):
     return src, out_dir, fake
 
 
-def _probe(monkeypatch, streams, calls=None):
+def _probe(monkeypatch, streams, calls=None, audio_count=1):
+    """Fake the one stream inventory probe; subtitles are what this suite reads."""
     def fake(path):
         if calls is not None:
             calls.append(Path(path))
-        return list(streams)
-    monkeypatch.setattr(compressor, "ffprobe_subtitle_streams", fake)
+        return compressor.StreamInventory(
+            subtitles=list(streams), audio_count=audio_count)
+    monkeypatch.setattr(compressor, "ffprobe_stream_inventory", fake)
     return fake
 
 
@@ -413,7 +415,7 @@ def test_probe_failure_blocks_deletion(video_env, monkeypatch):
     def boom(path):
         raise SubtitleProbeError("ffprobe crashed")
 
-    monkeypatch.setattr(compressor, "ffprobe_subtitle_streams", boom)
+    monkeypatch.setattr(compressor, "ffprobe_stream_inventory", boom)
 
     result = _run(src, out_dir, extract_english_subtitles=True)
 
@@ -435,7 +437,7 @@ def test_probe_raises_on_bad_json(monkeypatch, tmp_path):
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
     with pytest.raises(SubtitleProbeError):
-        ffprobe_subtitle_streams(tmp_path / "x.mkv")
+        ffprobe_stream_inventory(tmp_path / "x.mkv")
 
 
 def test_probe_raises_on_nonzero_exit(monkeypatch, tmp_path):
@@ -444,7 +446,7 @@ def test_probe_raises_on_nonzero_exit(monkeypatch, tmp_path):
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
     with pytest.raises(SubtitleProbeError):
-        ffprobe_subtitle_streams(tmp_path / "x.mkv")
+        ffprobe_stream_inventory(tmp_path / "x.mkv")
 
 
 def test_probe_raises_when_ffprobe_missing(monkeypatch, tmp_path):
@@ -453,12 +455,12 @@ def test_probe_raises_when_ffprobe_missing(monkeypatch, tmp_path):
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
     with pytest.raises(SubtitleProbeError):
-        ffprobe_subtitle_streams(tmp_path / "x.mkv")
+        ffprobe_stream_inventory(tmp_path / "x.mkv")
 
 
 def test_probe_returns_absolute_indexes(monkeypatch, tmp_path):
     payload = {"streams": [
-        {"index": 5, "codec_name": "subrip",
+        {"index": 5, "codec_name": "subrip", "codec_type": "subtitle",
          "tags": {"language": "eng"},
          "disposition": {"forced": 0, "hearing_impaired": 0}},
     ]}
@@ -471,10 +473,13 @@ def test_probe_returns_absolute_indexes(monkeypatch, tmp_path):
             cmd, 0, stdout=json.dumps(payload), stderr="")
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
-    streams = ffprobe_subtitle_streams(tmp_path / "x.mkv")
+    inventory = ffprobe_stream_inventory(tmp_path / "x.mkv")
 
-    assert [s["index"] for s in streams] == [5]
-    assert _has_pair(seen["cmd"], "-select_streams", "s")
+    assert [s["index"] for s in inventory.subtitles] == [5]
+    # The probe inventories every stream now - audio has to be counted from
+    # the same answer - so the classification happens here, not in ffprobe's
+    # stream selector.
+    assert "-select_streams" not in seen["cmd"]
     assert _has_pair(seen["cmd"], "-of", "json")
 
 
@@ -483,11 +488,11 @@ def test_probe_empty_stream_list_is_not_an_error(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
-    assert ffprobe_subtitle_streams(tmp_path / "x.mkv") == []
+    assert ffprobe_stream_inventory(tmp_path / "x.mkv") == ([], 0)
 
 
 def test_probe_rejects_stream_without_index(monkeypatch, tmp_path):
-    payload = {"streams": [{"codec_name": "subrip"}]}
+    payload = {"streams": [{"codec_name": "subrip", "codec_type": "subtitle"}]}
 
     def fake_run(cmd, **kw):
         return subprocess.CompletedProcess(
@@ -495,7 +500,7 @@ def test_probe_rejects_stream_without_index(monkeypatch, tmp_path):
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
     with pytest.raises(SubtitleProbeError):
-        ffprobe_subtitle_streams(tmp_path / "x.mkv")
+        ffprobe_stream_inventory(tmp_path / "x.mkv")
 
 
 # ── Group 9 - extraction failure fails closed ───────────────────────────────

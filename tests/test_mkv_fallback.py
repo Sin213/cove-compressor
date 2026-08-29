@@ -53,6 +53,13 @@ def _sub(index: int, codec: str, **tags) -> dict:
     return s
 
 
+# Big enough that the 1 MB targets below are a real reduction *and* leave a
+# usable video budget once the audio bitrate is reserved. A target that cannot
+# hold its audio is refused before encoding (see `tests/test_multi_audio.py`),
+# which is not the subject of any test in this file.
+SRC_BYTES = 4 * 1024 * 1024
+
+
 class FakeFfmpeg:
     """Stands in for `run_ffmpeg`, classifying and recording every invocation.
 
@@ -110,28 +117,31 @@ class FakeFfmpeg:
 def env(tmp_path, monkeypatch):
     """A source file, an output dir, and a faked encoder/probe stack."""
     src = tmp_path / "Movie.mov"
-    src.write_bytes(b"s" * 4096)
+    src.write_bytes(b"s" * SRC_BYTES)
     out_dir = tmp_path / "out"
     out_dir.mkdir()
 
     fake = FakeFfmpeg()
     monkeypatch.setattr(compressor, "run_ffmpeg", fake)
     monkeypatch.setattr(compressor, "ffprobe_duration", lambda p: 10.0)
-    monkeypatch.setattr(compressor, "ffprobe_subtitle_streams", lambda p: [])
+    monkeypatch.setattr(
+        compressor, "ffprobe_stream_inventory",
+        lambda p: compressor.StreamInventory(subtitles=[], audio_count=1))
     monkeypatch.setattr(compressor, "nvenc_available", lambda e="hevc_nvenc": False)
     monkeypatch.setattr(compressor, "amf_available", lambda e="hevc_amf": False)
     return src, out_dir, fake
 
 
-def _probe(monkeypatch, streams, calls=None):
-    """Fake `ffprobe_subtitle_streams`; `streams` may be an exception."""
+def _probe(monkeypatch, streams, calls=None, audio_count=1):
+    """Fake the shared stream inventory; `streams` may be an exception."""
     def fake(path):
         if calls is not None:
             calls.append(Path(path))
         if isinstance(streams, Exception):
             raise streams
-        return [dict(s) for s in streams]
-    monkeypatch.setattr(compressor, "ffprobe_subtitle_streams", fake)
+        return compressor.StreamInventory(
+            subtitles=[dict(s) for s in streams], audio_count=audio_count)
+    monkeypatch.setattr(compressor, "ffprobe_stream_inventory", fake)
 
 
 def _run(src, out_dir, fmt="MP4 (H.265)", mode="Quality preset",
@@ -254,7 +264,7 @@ def test_b4_pass1_failure_does_not_fall_back(env):
     src, out_dir, fake = env
     fake.pass1 = [(1, "pass 1 boom")]
 
-    result = _run(src, out_dir, mode="Target file size", mode_value="0.001")
+    result = _run(src, out_dir, mode="Target file size", mode_value="1")
 
     assert len(fake.pass1_cmds) == 1
     assert fake.final_cmds == [], "pass-1 failure must never reach a mux retry"
@@ -287,7 +297,7 @@ def test_b6_output_reservation_failure_does_not_fall_back(env, monkeypatch):
 
 def test_b7_skipped_result_does_not_fall_back(env):
     src, out_dir, fake = env
-    fake.encode_bytes = b"v" * 8192  # bigger than the 4096-byte source
+    fake.encode_bytes = b"v" * (SRC_BYTES + 1)  # bigger than the source
 
     result = _run(src, out_dir)
 

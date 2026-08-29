@@ -23,6 +23,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from typing import NamedTuple
 
 from PIL import Image, ImageOps
 
@@ -495,25 +496,40 @@ _UNKNOWN_LANG_TAGS = {"", "und", "unknown", "none"}
 
 
 class SubtitleProbeError(RuntimeError):
-    """ffprobe could not tell us what subtitle streams a file contains.
+    """ffprobe could not tell us what streams a file contains.
 
-    Deliberately distinct from 'there are no subtitle streams': the first is a
-    preservation failure, the second is a normal outcome.
+    Deliberately distinct from 'there are no subtitle streams' or 'there is no
+    audio': the first is a preservation failure, the others are normal
+    outcomes.
     """
 
 
-def ffprobe_subtitle_streams(path: Path) -> list[dict]:
-    """Return one dict per embedded subtitle stream, in file order.
+class StreamInventory(NamedTuple):
+    """What one ffprobe of a source tells every consumer that needs it.
 
-    Each dict carries at least the *absolute* file stream index, which is what
-    extraction maps against. Raises SubtitleProbeError when the answer cannot
-    be trusted - never an empty list on failure.
+    `subtitles` is the subtitle stream list Tab 3's mapping policy classifies
+    against, in file order, carrying absolute indexes. `audio_count` is how
+    many audio streams the explicit `-map 0:a?` policy will therefore encode,
+    which is what target-size accounting has to reserve bitrate for. Both come
+    out of the same probe: counting audio buys no second ffprobe.
+    """
+    subtitles: list[dict]
+    audio_count: int
+
+
+def ffprobe_stream_inventory(path: Path) -> StreamInventory:
+    """Inventory a source's streams with the one probe a job is allowed.
+
+    Each subtitle dict carries at least the *absolute* file stream index,
+    which is what extraction and the mapping policy map against. Raises
+    SubtitleProbeError when the answer cannot be trusted - never an empty
+    subtitle list and never a zero audio count on failure, since both of those
+    are legitimate answers a caller is entitled to act on.
     """
     cmd = [
         FFPROBE_BIN, "-v", "error",
-        "-select_streams", "s",
         "-show_entries",
-        "stream=index,codec_name:stream_tags=language,title:"
+        "stream=index,codec_type,codec_name:stream_tags=language,title:"
         "stream_disposition=default,forced,hearing_impaired",
         "-of", "json", str(path),
     ]
@@ -540,21 +556,30 @@ def ffprobe_subtitle_streams(path: Path) -> list[dict]:
 
     streams = data.get("streams")
     if streams is None:
-        return []
+        return StreamInventory(subtitles=[], audio_count=0)
     if not isinstance(streams, list):
         raise SubtitleProbeError("unexpected ffprobe stream list")
 
-    out: list[dict] = []
+    subtitles: list[dict] = []
+    audio_count = 0
     for s in streams:
         if not isinstance(s, dict):
             raise SubtitleProbeError("unexpected ffprobe stream entry")
         idx = s.get("index")
         # bool is an int subclass; an index that is not a plain int means we
-        # cannot map the stream safely, so refuse to guess.
+        # cannot map the stream safely, so refuse to guess. Applied to every
+        # stream, not just subtitles: an inventory that cannot describe one
+        # stream is not an inventory anything else should be trusted from.
         if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
-            raise SubtitleProbeError("subtitle stream without a usable index")
-        out.append(s)
-    return out
+            raise SubtitleProbeError("stream without a usable index")
+        kind = s.get("codec_type")
+        if kind == "subtitle":
+            subtitles.append(s)
+        elif kind == "audio":
+            # Counted by codec type, never by index range: absolute indexes
+            # are free to be non-contiguous.
+            audio_count += 1
+    return StreamInventory(subtitles=subtitles, audio_count=audio_count)
 
 
 def _stream_tag(stream: dict, name: str) -> str:
@@ -638,18 +663,19 @@ def build_subtitle_extract_cmd(input_path: Path, stream_index: int,
             + codec_args + ["-f", muxer, str(out_path)])
 
 
-def probe_subtitle_streams_once(input_path: Path
-                                ) -> tuple[list[dict] | None, str | None]:
-    """The one subtitle discovery a video job is allowed to make.
+def probe_stream_inventory_once(input_path: Path
+                                ) -> tuple[StreamInventory | None, str | None]:
+    """The one stream discovery a video job is allowed to make.
 
-    Every consumer - sidecar extraction and the stream-mapping policy of each
-    explicitly mapped container (MP4, Matroska) - reads the same result, so
-    enabling one never costs a second ffprobe. On
-    failure the stream list is None (never an empty list, which would read as
-    "this file has no subtitles") alongside a description of what went wrong.
+    Every consumer - sidecar extraction, the stream-mapping policy of each
+    explicitly mapped container (MP4, Matroska), and the target-size audio
+    budget - reads the same result, so enabling one never costs a second
+    ffprobe. On failure the inventory is None (never an empty subtitle list,
+    which would read as "this file has no subtitles", and never a zero audio
+    count) alongside a description of what went wrong.
     """
     try:
-        return ffprobe_subtitle_streams(input_path), None
+        return ffprobe_stream_inventory(input_path), None
     except SubtitleProbeError as e:
         return None, str(e)
 
@@ -662,7 +688,7 @@ def _prepare_english_subtitles(input_path: Path, output_path: Path,
                                ) -> tuple[list[dict], list[str], Path | None]:
     """Extract every English subtitle stream into throwaway temp files.
 
-    `streams` / `probe_error` come from `probe_subtitle_streams_once`; this
+    `streams` / `probe_error` come from `probe_stream_inventory_once`; this
     function no longer probes, so the MP4 mapping policy can share the answer.
 
     Returns (pending, errors, temp_dir). `pending` entries are
@@ -772,10 +798,13 @@ def build_mp4_stream_map_args(subtitle_streams: list[dict] | None) -> list:
     back to ffmpeg's automatic selection, which is exactly the behaviour this
     policy exists to replace.
 
-    Audio is mapped with a trailing `?`: a source with no audio track must
-    still convert, so the mapping is optional rather than mandatory.
+    Audio is mapped by type (`0:a?`) rather than by first stream: an MP4 with
+    an English, a Japanese and a commentary track keeps all three, in source
+    order, and each is encoded with the one audio codec and bitrate the format
+    already selected. The trailing `?` is what keeps a silent source
+    converting - the map is optional, not mandatory.
     """
-    args = ["-map", "0:v:0", "-map", "0:a:0?"]
+    args = ["-map", "0:v:0", "-map", "0:a?"]
     indexes = ([] if subtitle_streams is None
                else mp4_mappable_subtitle_indexes(subtitle_streams))
     for idx in indexes:
@@ -819,14 +848,16 @@ def build_matroska_stream_map_args(
     failed, which disables subtitles outright rather than handing the choice
     back to the implicit selection this policy exists to replace.
 
-    Audio and attachments stay optional: a silent source and a source with no
+    Audio is mapped by type (`0:a?`), so every source audio stream survives in
+    source order - a multi-language film keeps all of its tracks. Audio and
+    attachments stay optional: a silent source and a source with no
     attachments must both still convert. That optionality is what makes
     attachments free - `0:t?` needs no classification, so it needs no probe of
     its own. Attachments are stream-copied because there is no such thing as
     re-encoding one. Only `t` (attachment) is named; `d` (data) stays unmapped,
     exactly as it is for MP4.
     """
-    args = ["-map", "0:v:0", "-map", "0:a:0?"]
+    args = ["-map", "0:v:0", "-map", "0:a?"]
     indexes = ([] if subtitle_streams is None
                else matroska_mappable_subtitle_indexes(subtitle_streams))
     if indexes:
@@ -1105,10 +1136,46 @@ def build_scale_filter(long_side: int) -> str:
     )
 
 
-def calc_video_bitrate_kbps(target_bytes: int, duration: float, audio_kbps: int) -> int:
+# The lowest video bitrate worth asking an encoder for. Reaching it by
+# subtraction means the target cannot hold what is being put in it, which is a
+# refusal (see `target_fits_audio_budget`), not a value to clamp to.
+MIN_VIDEO_KBPS = 80
+
+
+def usable_total_kbps(target_bytes: int, duration: float) -> float:
+    """The whole file's bitrate budget, less the 3% container allowance."""
     usable = target_bytes * 0.97
-    total_kbps = (usable * 8) / duration / 1000.0
-    return max(int(total_kbps - audio_kbps), 80)
+    return (usable * 8) / duration / 1000.0
+
+
+def total_audio_kbps(audio_kbps: int, audio_count: int) -> int:
+    """The selected bitrate is per track, so N tracks cost N times it."""
+    return audio_kbps * audio_count
+
+
+def target_fits_audio_budget(target_bytes: int, duration: float,
+                             audio_kbps: int, audio_count: int) -> bool:
+    """Whether any video at all fits alongside the audio being preserved.
+
+    Four 128 kbps tracks in a 500 kbps budget leave nothing for video. The
+    predecessor's clamp would have handed the encoder 80 kbps anyway and
+    missed the target by the whole difference; preserving every track means
+    saying so up front instead.
+    """
+    return (usable_total_kbps(target_bytes, duration)
+            - total_audio_kbps(audio_kbps, audio_count)) >= MIN_VIDEO_KBPS
+
+
+def calc_video_bitrate_kbps(target_bytes: int, duration: float,
+                            audio_kbps: int, audio_count: int = 1) -> int:
+    """What is left for video once every mapped audio stream is paid for.
+
+    `audio_count` defaults to 1, which is the single-stream arithmetic this
+    has always done, so a one-audio source computes exactly what it used to.
+    """
+    return max(int(usable_total_kbps(target_bytes, duration)
+                   - total_audio_kbps(audio_kbps, audio_count)),
+               MIN_VIDEO_KBPS)
 
 
 def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
@@ -1470,7 +1537,8 @@ def compress_video(
                     "original": original_size, "new": original_size,
                     "msg": "target size >= original; nothing to do"}
 
-        video_kbps = calc_video_bitrate_kbps(target_bytes, duration, int(audio_kbps))
+        # The video budget itself is settled below, once the inventory says
+        # how many audio streams this file will be paying for.
         # NVENC and AMF each do their own single-invocation rate control, so
         # neither uses the log-file two-pass ABR path the software encoders do.
         use_two_pass = two_pass_ok and not use_nvenc and not use_amf
@@ -1489,12 +1557,42 @@ def compress_video(
     # transcode to mov_text, Matroska to know which subtitle stream its
     # text-based encoder can actually reach. Attachments add nothing here -
     # `-map 0:t?` classifies nothing - so enabling them costs no probe.
-    needs_subtitle_probe = (extract_english_subtitles
-                            or muxer in ("mp4", "matroska"))
-    sub_streams: list[dict] | None = None
-    sub_probe_error: str | None = None
-    if needs_subtitle_probe:
-        sub_streams, sub_probe_error = probe_subtitle_streams_once(input_path)
+    # The same probe also counts the audio streams the explicit `-map 0:a?`
+    # policy will encode, which is what the target-size budget has to reserve
+    # bitrate for; one inventory answers both questions.
+    needs_stream_probe = (extract_english_subtitles
+                          or muxer in ("mp4", "matroska"))
+    inventory: StreamInventory | None = None
+    probe_error: str | None = None
+    if needs_stream_probe:
+        inventory, probe_error = probe_stream_inventory_once(input_path)
+    sub_streams = None if inventory is None else inventory.subtitles
+
+    if mode in ("Target file size", "Target reduction"):
+        if muxer in ("mp4", "matroska"):
+            # These containers map every audio stream, so the budget depends
+            # on how many there are. An untrustworthy count would invalidate
+            # the whole target, and no guess is safer than any other: fail
+            # closed before anything is reserved or encoded.
+            if inventory is None:
+                return {"file": input_path, "status": "error",
+                        "msg": f"Could not read audio streams "
+                               f"(ffprobe failed: {probe_error})"}
+            audio_count = inventory.audio_count
+        else:
+            # WebM keeps ffmpeg's implicit selection, and with it the
+            # single-stream budget it has always been given.
+            audio_count = 1
+
+        if not target_fits_audio_budget(target_bytes, duration,
+                                        int(audio_kbps), audio_count):
+            return {"file": input_path, "status": "error",
+                    "msg": f"target too small for {audio_count} audio "
+                           f"track{'' if audio_count == 1 else 's'} at "
+                           f"{int(audio_kbps)} kbps each"}
+
+        video_kbps = calc_video_bitrate_kbps(
+            target_bytes, duration, int(audio_kbps), audio_count)
 
     # Containers that cannot (MP4) or should not (Matroska, which would
     # otherwise drop attachments) leave selection to ffmpeg get explicit
@@ -1545,7 +1643,7 @@ def compress_video(
                 sub_pending, sub_errors, sub_temp_dir = \
                     _prepare_english_subtitles(
                         input_path, output_path, output_dir, cancel_flag,
-                        sub_streams, sub_probe_error)
+                        sub_streams, probe_error)
                 if cancel_flag.is_set():
                     result = {"file": input_path, "status": "error",
                               "msg": "cancelled"}

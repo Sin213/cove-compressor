@@ -16,8 +16,8 @@ Locked down here:
      attachments, and preservation adds no third invocation.
   D. The Tab 2b MP4 -> MKV fallback inherits the policy: attempt 1 (MP4) has
      no attachment map, attempt 2 (Matroska) does, and there is never a third.
-  E. The neighbouring stream contract survives: one video map, first-audio-only
-     (`0:a:0?`, *not* all-audio), and the subtitle map is not dropped.
+  E. The neighbouring stream contract survives: one video map, one optional
+     audio map (`0:a?`), and the subtitle map is not dropped.
   F. Attachment preservation costs no new ffprobe. The optional `0:t?`
      selector replaces classification entirely.
   G. A Matroska encode that fails is terminal - no "safe retry without
@@ -77,6 +77,12 @@ TEXT_SUB = [_sub(3, "subrip")]
 # subtitle codec. ffmpeg's implicit selection quietly skipped them; an explicit
 # map does not, which is exactly the trap this policy has to avoid.
 BITMAP_CODECS = ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"]
+
+# Big enough that the 1 MB targets below are a real reduction *and* leave a
+# usable video budget once the audio bitrate is reserved. A target that cannot
+# hold its audio is refused before encoding (see `tests/test_multi_audio.py`),
+# which is not the subject of any test in this file.
+SRC_BYTES = 4 * 1024 * 1024
 
 
 class FakeFfmpeg:
@@ -152,28 +158,31 @@ class FakeFfmpeg:
 def env(tmp_path, monkeypatch):
     """A source file, an output dir, and a faked encoder/probe stack."""
     src = tmp_path / "Movie.mov"
-    src.write_bytes(b"s" * 4096)
+    src.write_bytes(b"s" * SRC_BYTES)
     out_dir = tmp_path / "out"
     out_dir.mkdir()
 
     fake = FakeFfmpeg()
     monkeypatch.setattr(compressor, "run_ffmpeg", fake)
     monkeypatch.setattr(compressor, "ffprobe_duration", lambda p: 10.0)
-    monkeypatch.setattr(compressor, "ffprobe_subtitle_streams", lambda p: [])
+    monkeypatch.setattr(
+        compressor, "ffprobe_stream_inventory",
+        lambda p: compressor.StreamInventory(subtitles=[], audio_count=1))
     monkeypatch.setattr(compressor, "nvenc_available", lambda e="hevc_nvenc": False)
     monkeypatch.setattr(compressor, "amf_available", lambda e="hevc_amf": False)
     return src, out_dir, fake
 
 
-def _probe(monkeypatch, streams, calls=None):
-    """Fake `ffprobe_subtitle_streams`; `streams` may be an exception."""
+def _probe(monkeypatch, streams, calls=None, audio_count=1):
+    """Fake the shared stream inventory; `streams` may be an exception."""
     def fake(path):
         if calls is not None:
             calls.append(Path(path))
         if isinstance(streams, Exception):
             raise streams
-        return [dict(s) for s in streams]
-    monkeypatch.setattr(compressor, "ffprobe_subtitle_streams", fake)
+        return compressor.StreamInventory(
+            subtitles=[dict(s) for s in streams], audio_count=audio_count)
+    monkeypatch.setattr(compressor, "ffprobe_stream_inventory", fake)
 
 
 def _run(src, out_dir, fmt="MKV (H.265)", mode="Quality preset",
@@ -249,7 +258,7 @@ def test_b1_direct_mkv_single_pass_maps_and_copies_attachments(env, monkeypatch)
     assert len(fake.final_cmds) == 1
     cmd = fake.mux_cmd
     assert _muxer_of(cmd) == "matroska"
-    assert _maps(cmd) == ["0:v:0", "0:a:0?", "0:3", "0:t?"]
+    assert _maps(cmd) == ["0:v:0", "0:a?", "0:3", "0:t?"]
     assert _pair_count(cmd, "-c:t", "copy") == 1
 
 
@@ -279,7 +288,7 @@ def test_b3_many_attachments_do_not_multiply_the_command(env):
 # ══ GROUP C — two-pass safety ════════════════════════════════════════════════
 
 def _two_pass(src, out_dir, **kw):
-    return _run(src, out_dir, mode="Target file size", mode_value=0.001, **kw)
+    return _run(src, out_dir, mode="Target file size", mode_value=1, **kw)
 
 
 def test_c1_pass_one_never_mentions_attachments(env):
@@ -380,19 +389,23 @@ def test_e1_matroska_maps_exactly_one_video_stream():
     assert [m for m in maps if m.startswith("0:v")] == ["0:v:0"]
 
 
-def test_e2_matroska_audio_stays_first_track_only():
-    """Adding `0:t?` beside the audio map must not widen it to all audio."""
+def test_e2_matroska_maps_audio_once_and_optionally():
+    """`0:t?` sits beside the audio map, never in place of or duplicating it.
+
+    The audio map itself is the all-streams `0:a?` (see
+    `tests/test_multi_audio.py`); what matters here is that attachment
+    preservation neither widens nor suppresses it.
+    """
     maps = _maps(build_matroska_stream_map_args(TEXT_SUB))
-    assert [m for m in maps if m.startswith("0:a")] == ["0:a:0?"]
-    assert "0:a?" not in maps
-    assert "0:a" not in maps
+    assert [m for m in maps if m.startswith("0:a")] == ["0:a?"]
+    assert "0:a" not in maps, "a mandatory map breaks silent sources"
 
 
 def test_e3_matroska_maps_the_first_text_subtitle_by_absolute_index():
     """Reproduces what ffmpeg's implicit selection used to do for us."""
     args = build_matroska_stream_map_args([_sub(3, "subrip"),
                                            _sub(5, "ass")])
-    assert _maps(args) == ["0:v:0", "0:a:0?", "0:3", "0:t?"]
+    assert _maps(args) == ["0:v:0", "0:a?", "0:3", "0:t?"]
     assert "-sn" not in args
 
 
@@ -423,7 +436,7 @@ def test_e6_matroska_never_maps_a_bitmap_subtitle(codec):
     real ffmpeg 8.1.1 - see the handoff.
     """
     args = build_matroska_stream_map_args([_sub(2, codec)])
-    assert _maps(args) == ["0:v:0", "0:a:0?", "0:t?"]
+    assert _maps(args) == ["0:v:0", "0:a?", "0:t?"]
     assert "-sn" in args
 
 
@@ -431,7 +444,7 @@ def test_e7_matroska_skips_a_bitmap_stream_to_reach_a_text_one():
     """Bitmap first, text second: the text one is what implicit would pick."""
     args = build_matroska_stream_map_args([_sub(2, "hdmv_pgs_subtitle"),
                                            _sub(4, "subrip")])
-    assert _maps(args) == ["0:v:0", "0:a:0?", "0:4", "0:t?"]
+    assert _maps(args) == ["0:v:0", "0:a?", "0:4", "0:t?"]
     assert "-sn" not in args
 
 
@@ -443,7 +456,7 @@ def test_e8_matroska_disables_subtitles_when_none_are_mappable(streams):
     implicit selection, which is the behaviour this policy replaces.
     """
     args = build_matroska_stream_map_args(streams)
-    assert _maps(args) == ["0:v:0", "0:a:0?", "0:t?"]
+    assert _maps(args) == ["0:v:0", "0:a?", "0:t?"]
     assert "-sn" in args
     assert _pair_count(args, "-c:t", "copy") == 1
 
@@ -465,7 +478,7 @@ def test_e4_mp4_bitmap_and_unknown_exclusion_is_untouched():
     args = build_stream_map_args(
         "mp4", [_sub(2, "hdmv_pgs_subtitle"), _sub(3, "subrip"),
                 _sub(4, "nonsense_codec")])
-    assert _maps(args) == ["0:v:0", "0:a:0?", "0:3"]
+    assert _maps(args) == ["0:v:0", "0:a?", "0:3"]
 
 
 # ══ GROUP F — no new probes, no extra subtitle work ══════════════════════════
