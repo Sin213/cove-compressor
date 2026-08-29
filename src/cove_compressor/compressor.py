@@ -1286,9 +1286,11 @@ def build_video_encoder_args(
                              invocation `-multipass fullres` (never the log-file
                              two-pass, which NVENC doesn't use).
       • NVENC quality      → VBR constant-quality via -cq with -b:v 0.
-      • AMF bitrate        → VBR with the same capped-maxrate heuristic; AMF
-                             has no `-multipass`, so size targeting is a
-                             single-pass approximation like NVENC's.
+      • AMF bitrate        → peak-constrained VBR (`vbr_peak`, AMF's spelling —
+                             it has no bare `vbr`) with the same capped-maxrate
+                             heuristic; AMF has no `-multipass`, so size
+                             targeting is a single-pass approximation like
+                             NVENC's.
       • AMF quality        → constant-quality via -rc cqp -qp on the 0-51 scale.
     """
     is_nvenc = encoder.endswith("_nvenc")
@@ -1327,9 +1329,14 @@ def build_video_encoder_args(
                   "-bufsize", f"{int(video_kbps * 2)}k",
                   "-multipass", "fullres"]
         elif is_amf:
+            # AMF's rate-control vocabulary has no bare `vbr` - the peak-
+            # constrained mode is spelled `vbr_peak`, and anything else fails
+            # at option parsing before a frame is encoded. NVENC's own `vbr`
+            # above is a different encoder's different option; the two must
+            # not be unified.
             # AMF has no equivalent of NVENC's -multipass fullres; sizes land
             # close to target but aren't as exact as the software two-pass.
-            a += ["-rc", "vbr", "-b:v", f"{video_kbps}k",
+            a += ["-rc", "vbr_peak", "-b:v", f"{video_kbps}k",
                   "-maxrate", f"{int(video_kbps * 1.4)}k",
                   "-bufsize", f"{int(video_kbps * 2)}k"]
         else:
