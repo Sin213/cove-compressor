@@ -1559,10 +1559,36 @@ MKV_FALLBACK_TARGET_FORMAT = "MKV (H.265)"
 # container on the same filesystem cannot succeed and only enlarges the mess.
 NO_SPACE_SIGNALS = ("no space left on device", "enospc")
 
+# ffmpeg opens its report by announcing every file the job names:
+#
+#     Input #0, matroska,webm, from 'C:\Videos\Movie.mkv':
+#     Output #0, mp4, to 'C:\Output\Movie.mp4':
+#
+# Those declare what the job *is*; they say nothing about what went wrong, and
+# the only part of them the user writes is the path. A file may legitimately be
+# called "No space left on device.mp4", and reading that name as a diagnostic
+# turned an unrelated mux failure into a full disk - which then cost that
+# failure the single MKV retry it had earned. Matched to the end of the line so
+# the path itself, quotes and all, is what gets excluded; ordinary prose that
+# merely opens with the same word ("Output failed: ENOSPC") is untouched.
+_FFMPEG_PATH_ANNOUNCEMENT = re.compile(
+    r"(?:Input #\d+, [^']*, from |Output #\d+, [^']*, to )'.*':$")
+
 
 def _is_no_space_failure(msg: str | None) -> bool:
-    text = (msg or "").lower()
-    return any(signal in text for signal in NO_SPACE_SIGNALS)
+    """Whether ffmpeg blamed this failure on space, judged line by line.
+
+    Each line is classified with the path it announced removed, rather than
+    skipped outright: a line is only ever partly an announcement, so anything
+    ffmpeg said around one - including the "ffmpeg failed:" prefix this message
+    may already carry - still counts. Matching is otherwise the predecessor's:
+    lowercase substring, anywhere, over exactly the committed vocabulary.
+    """
+    for line in (msg or "").splitlines():
+        lowered = _FFMPEG_PATH_ANNOUNCEMENT.sub("", line.rstrip()).lower()
+        if any(signal in lowered for signal in NO_SPACE_SIGNALS):
+            return True
+    return False
 
 
 def _mkv_fallback_eligible(video_format_key: str, result: dict,
