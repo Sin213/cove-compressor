@@ -1291,6 +1291,13 @@ def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
         return -1, f"{FFMPEG_BIN} not found on PATH"
 
     stderr_tail: deque = deque(maxlen=40)
+    # The one line that said the disk was full, held outside the rolling
+    # window. ffmpeg announces ENOSPC once and then emits as much teardown
+    # chatter as it likes, so by the time it exits the window is often all
+    # chatter and the decisive line is gone - which is how a full disk used to
+    # arrive downstream looking like an ordinary mux failure. This is a single
+    # latched line, not a transcript: retention stays O(the existing window).
+    no_space_line: str | None = None
     stderr_queue: queue.Queue = queue.Queue()
     assert proc.stderr is not None
 
@@ -1337,6 +1344,11 @@ def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
             eof_received = True
         elif line:
             stderr_tail.append(line.rstrip())
+            # Same predicate the failure classifier uses, asked here while the
+            # line is still in hand. Latched once: later lines can only add
+            # chatter, never unsay a disk that filled up.
+            if no_space_line is None and _is_no_space_failure(line):
+                no_space_line = line.rstrip()
             progress_time = parse_ffmpeg_time(line)
             if progress_time is not None:
                 last_progress = time.monotonic()
@@ -1358,6 +1370,15 @@ def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
             break
 
     tail = list(stderr_tail)[-5:]
+    # A failure that ffmpeg blamed on space keeps saying so. If the tail has
+    # already scrolled past that line, it goes back in front of it - one extra
+    # line, on the one failure that needs it, so the tail itself keeps its
+    # size. Cancellation and stall returns are unaffected: they never reach
+    # here. Neither does a zero exit, whose message nothing consults, so a
+    # warning cannot turn a success into a disk-full report.
+    if (proc.returncode != 0 and no_space_line is not None
+            and not _is_no_space_failure("\n".join(tail))):
+        tail = [no_space_line] + tail
     return proc.returncode, "\n".join(tail)
 
 
