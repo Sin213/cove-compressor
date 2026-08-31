@@ -764,8 +764,8 @@ def _prepare_english_subtitles(input_path: Path, output_path: Path,
 #
 # Matroska maps explicitly too, but for the opposite reason: it can carry
 # more than ffmpeg's automatic selection picks, and attachments are the part
-# worth naming (see `build_matroska_stream_map_args`). WebM keeps the implicit
-# selection - widening its behaviour is not this slice's job.
+# worth naming (see `build_matroska_stream_map_args`). WebM maps explicitly
+# for both reasons at once - see `build_webm_stream_map_args`.
 
 # Text subtitle codecs MP4 can carry once transcoded to mov_text. Deliberately
 # the same vocabulary the sidecar path classifies against, so the two features
@@ -778,12 +778,15 @@ def mp4_subtitle_codec_is_compatible(codec_name: str | None) -> bool:
     return (codec_name or "").strip().lower() in MP4_TEXT_SUBTITLE_CODECS
 
 
-def mp4_mappable_subtitle_indexes(subtitle_streams: list[dict]) -> list[int]:
-    """Absolute ffprobe indexes of the subtitle streams MP4 may carry.
+def _mappable_subtitle_indexes(subtitle_streams: list[dict],
+                               vocabulary: set[str]) -> list[int]:
+    """Absolute ffprobe indexes of the streams `vocabulary` admits.
 
     Absolute file indexes, never subtitle-relative ones: excluding a bitmap
     track must not renumber the text track that follows it. Anything without a
-    usable plain-int index is dropped rather than guessed at.
+    usable plain-int index is dropped rather than guessed at. The index rule is
+    shared by every container; only the vocabulary differs, so a container
+    cannot accidentally invent its own idea of what a mappable index is.
     """
     out: list[int] = []
     for s in subtitle_streams:
@@ -793,9 +796,15 @@ def mp4_mappable_subtitle_indexes(subtitle_streams: list[dict]) -> list[int]:
         # bool is an int subclass; only a plain non-negative int can be mapped.
         if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
             continue
-        if mp4_subtitle_codec_is_compatible(s.get("codec_name")):
+        if (s.get("codec_name") or "").strip().lower() in vocabulary:
             out.append(idx)
     return out
+
+
+def mp4_mappable_subtitle_indexes(subtitle_streams: list[dict]) -> list[int]:
+    """Absolute ffprobe indexes of the subtitle streams MP4 may carry."""
+    return _mappable_subtitle_indexes(subtitle_streams,
+                                      MP4_TEXT_SUBTITLE_CODECS)
 
 
 def build_mp4_stream_map_args(subtitle_streams: list[dict] | None) -> list:
@@ -880,18 +889,95 @@ def build_matroska_stream_map_args(
     return args + ["-map", "0:t?", "-c:t", "copy"]
 
 
+# Text subtitle codecs WebM can carry once transcoded to WebVTT - WebM's only
+# subtitle format. Deliberately its own set rather than an alias of MP4's:
+# every name here was transcoded into a real WebM by the installed ffmpeg
+# (explicit absolute map, `-c:s webvtt`) and came back out as a `webvtt`
+# stream with its text intact, and only names that survived that are listed.
+# The MP4/Matroska vocabulary additionally carries `srt`, `vtt` and `ssa`,
+# which are ffmpeg *encoder* aliases rather than codec names: ffprobe reports
+# the streams they produce as `subrip`, `webvtt` and `ass`, so no source can
+# present them here and they are left out rather than assumed.
+WEBM_TEXT_SUBTITLE_CODECS = {"subrip", "ass", "webvtt", "mov_text", "text"}
+
+
+def webm_subtitle_codec_is_compatible(codec_name: str | None) -> bool:
+    """True only for codecs proven to transcode to WebVTT on this ffmpeg."""
+    return (codec_name or "").strip().lower() in WEBM_TEXT_SUBTITLE_CODECS
+
+
+def webm_mappable_subtitle_indexes(subtitle_streams: list[dict]) -> list[int]:
+    """Absolute indexes of the subtitle streams WebM may carry."""
+    return _mappable_subtitle_indexes(subtitle_streams,
+                                      WEBM_TEXT_SUBTITLE_CODECS)
+
+
+def build_webm_stream_map_args(subtitle_streams: list[dict] | None) -> list:
+    """Explicit WebM stream selection for the muxing pass.
+
+    WebM was the last container Cove produced that still left this to ffmpeg,
+    and implicit selection was quietly lossy in two directions at once. It
+    takes the first *audio* stream, so a three-language source arrived as a
+    one-language file. It takes the first subtitle stream its default text
+    encoder can reach and drops the rest, so a film with English, Japanese and
+    Spanish subtitles arrived with two of them missing. Both losses were
+    silent: the job reported success.
+
+    So WebM names what it carries. `0:a?` keeps every audio stream in source
+    order while staying optional, which is what lets a silent source convert.
+    Every WebM-safe *text* subtitle stream is named by absolute index - every
+    one, not just the first - with ineligible streams skipped around rather
+    than ending the scan, so a bitmap track sitting between two text tracks
+    costs neither of them. Naming `0:s:0?` instead would force a bitmap track
+    into a text encoder and fail the whole job.
+
+    `-c:s webvtt` appears only when something was actually mapped: WebVTT is
+    WebM's only subtitle format, and naming an encoder for streams that do not
+    exist is how a working encode turns into a mux error. Nothing eligible
+    means `-sn`, never a silent hand-back to the implicit selection this
+    policy exists to replace - which is also why `subtitle_streams` being None
+    (discovery failed) disables subtitles rather than defaulting to anything.
+
+    Attachments and data streams are simply never named. WebM has no
+    attachment support to preserve, so unlike Matroska there is nothing here
+    worth a `0:t?`; explicit positive mapping excludes both without needing
+    negative filters.
+    """
+    args = ["-map", "0:v:0", "-map", "0:a?"]
+    indexes = ([] if subtitle_streams is None
+               else webm_mappable_subtitle_indexes(subtitle_streams))
+    for idx in indexes:
+        args += ["-map", f"0:{idx}"]
+    if indexes:
+        args += ["-c:s", "webvtt"]
+    else:
+        args += ["-sn"]
+    return args
+
+
+# The muxers that name their own streams. Membership is what decides three
+# things at once - that the job owes itself a stream inventory, that the
+# target-size budget must reserve one audio bitrate per mapped stream, and
+# that pass 1 must name its video stream - so they cannot drift apart.
+EXPLICITLY_MAPPED_MUXERS = ("mp4", "matroska", "webm")
+
+
 def build_stream_map_args(muxer: str, subtitle_streams: list[dict] | None) -> list:
     """The one place a container's stream-selection policy is decided.
 
     Both the directly requested encode and the MP4 -> MKV fallback attempt come
     through here, so the fallback inherits Matroska's attachment handling by
-    construction rather than by a second copy of the rule. WebM keeps ffmpeg's
-    implicit selection; widening it is not this slice's job.
+    construction rather than by a second copy of the rule. Every container Cove
+    targets now maps explicitly; anything else keeps ffmpeg's implicit
+    selection, which is the honest answer for a muxer with no policy written
+    for it.
     """
     if muxer == "mp4":
         return build_mp4_stream_map_args(subtitle_streams)
     if muxer == "matroska":
         return build_matroska_stream_map_args(subtitle_streams)
+    if muxer == "webm":
+        return build_webm_stream_map_args(subtitle_streams)
     return []
 
 
@@ -912,7 +998,7 @@ def build_pass1_map_args_for(muxer: str) -> list:
     analysis pass too, or ffmpeg would be free to analyse a different video
     stream than the one being encoded.
     """
-    if muxer in ("mp4", "matroska"):
+    if muxer in EXPLICITLY_MAPPED_MUXERS:
         return build_pass1_stream_map_args()
     return []
 
@@ -1575,13 +1661,14 @@ def compress_video(
     # costs exactly one ffprobe.
     # Every explicitly mapped container needs it: MP4 to know what it can
     # transcode to mov_text, Matroska to know which subtitle stream its
-    # text-based encoder can actually reach. Attachments add nothing here -
-    # `-map 0:t?` classifies nothing - so enabling them costs no probe.
+    # text-based encoder can actually reach, WebM to know which it can
+    # transcode to WebVTT. Attachments add nothing here - `-map 0:t?`
+    # classifies nothing - so enabling them costs no probe.
     # The same probe also counts the audio streams the explicit `-map 0:a?`
     # policy will encode, which is what the target-size budget has to reserve
     # bitrate for; one inventory answers both questions.
     needs_stream_probe = (extract_english_subtitles
-                          or muxer in ("mp4", "matroska"))
+                          or muxer in EXPLICITLY_MAPPED_MUXERS)
     inventory: StreamInventory | None = None
     probe_error: str | None = None
     if needs_stream_probe:
@@ -1589,7 +1676,7 @@ def compress_video(
     sub_streams = None if inventory is None else inventory.subtitles
 
     if mode in ("Target file size", "Target reduction"):
-        if muxer in ("mp4", "matroska"):
+        if muxer in EXPLICITLY_MAPPED_MUXERS:
             # These containers map every audio stream, so the budget depends
             # on how many there are. An untrustworthy count would invalidate
             # the whole target, and no guess is safer than any other: fail
@@ -1600,8 +1687,8 @@ def compress_video(
                                f"(ffprobe failed: {probe_error})"}
             audio_count = inventory.audio_count
         else:
-            # WebM keeps ffmpeg's implicit selection, and with it the
-            # single-stream budget it has always been given.
+            # A muxer with no explicit policy keeps ffmpeg's implicit
+            # selection, and with it the single-stream budget that matches it.
             audio_count = 1
 
         if not target_fits_audio_budget(target_bytes, duration,
@@ -1615,8 +1702,9 @@ def compress_video(
             target_bytes, duration, int(audio_kbps), audio_count)
 
     # Containers that cannot (MP4) or should not (Matroska, which would
-    # otherwise drop attachments) leave selection to ffmpeg get explicit
-    # positive maps. WebM keeps ffmpeg's implicit selection.
+    # otherwise drop attachments; WebM, which would otherwise drop every
+    # audio and subtitle track but the first) leave selection to ffmpeg get
+    # explicit positive maps.
     stream_map_args = build_stream_map_args(muxer, sub_streams)
     pass1_map_args = build_pass1_map_args_for(muxer)
 

@@ -301,11 +301,13 @@ def test_mkv_maps_explicitly_without_the_mp4_policy(env, monkeypatch):
     assert "mov_text" not in fake.mux_cmd
 
 
-def test_webm_keeps_implicit_selection(env, monkeypatch):
+def test_webm_maps_explicitly_into_webvtt(env, monkeypatch):
+    """WebM gained the same explicit policy, with its own subtitle codec."""
     src, out_dir, fake = env
     _probe(monkeypatch, [_sub(3, "subrip")])
     assert _run(src, out_dir, fmt="WebM (VP9)")["status"] == "ok"
-    assert _maps(fake.mux_cmd) == []
+    assert _maps(fake.mux_cmd) == ["0:v:0", "0:a?", "0:3"]
+    assert fake.mux_cmd[fake.mux_cmd.index("-c:s") + 1] == "webvtt"
 
 
 # ── A: one subtitle probe per file, never two ────────────────────────────────
@@ -331,11 +333,13 @@ def test_probe_runs_once_for_mp4_with_extraction_off(env, monkeypatch):
     assert len(calls) == 1
 
 
-def test_implicitly_selected_container_adds_no_probe(env, monkeypatch):
-    """WebM still keeps ffmpeg's implicit selection, so it classifies nothing.
+def test_explicitly_mapped_container_still_probes_only_once(env, monkeypatch):
+    """Every container Cove targets classifies its subtitles - once.
 
-    MKV no longer qualifies: it maps explicitly now and so must classify its
-    subtitle streams first (see `tests/test_mkv_attachments.py`).
+    MKV stopped qualifying as implicit when it gained attachments, and WebM
+    when it gained its own explicit policy. What survives is the invariant
+    that actually protects the user: naming streams costs one probe, never a
+    second one per container that wants an answer.
     """
     src, out_dir, _fake = env
     calls: list[Path] = []
@@ -343,7 +347,7 @@ def test_implicitly_selected_container_adds_no_probe(env, monkeypatch):
 
     _run(src, out_dir, fmt="WebM (VP9)")
 
-    assert calls == []
+    assert len(calls) == 1
 
 
 def test_successful_mp4_runs_exactly_one_encode_lifecycle(env, monkeypatch):

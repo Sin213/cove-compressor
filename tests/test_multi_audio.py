@@ -13,8 +13,9 @@ three tracks at 192 kbps reserve 576 kbps, they do not share 192.
 
 Locked down here:
 
-  A. Container policy: MP4 and Matroska map `0:a?` exactly once; WebM keeps
-     ffmpeg's implicit selection, unchanged by this slice.
+  A. Container policy: every explicitly mapped container maps `0:a?` exactly
+     once. WebM was widened into the same policy later (see
+     `tests/test_webm_stream_policy.py`), so it is checked here too.
   B. Zero, one and many audio streams all behave.
   C. `Target file size` reserves `count x audio_kbps`, and one track computes
      exactly what the single-track predecessor computed.
@@ -245,13 +246,16 @@ def test_a3_matroska_maps_every_audio_stream_optionally(env, monkeypatch):
     assert "0:a:0?" not in maps
 
 
-def test_a4_webm_stream_policy_is_untouched(env):
-    """WebM keeps implicit selection: this slice adds no maps to it."""
+def test_a4_webm_maps_every_audio_stream_optionally(env, monkeypatch):
+    """WebM joined the all-audio policy; the selector is the same one."""
     src, out_dir, fake = env
-    assert build_stream_map_args("webm", TEXT_SUB) == []
+    fake.audio_streams = 3
+    _inventory(monkeypatch, audio_count=3)
 
     assert _run(src, out_dir, fmt="WebM (VP9)")["status"] == "ok"
-    assert "0:a?" not in _maps(fake.mux_cmd)
+    maps = _maps(fake.mux_cmd)
+    assert "0:a?" in maps
+    assert "0:a:0?" not in maps
 
 
 @pytest.mark.parametrize("builder", [build_mp4_stream_map_args,

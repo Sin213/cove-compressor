@@ -590,13 +590,21 @@ def test_j4_public_mp4_path_is_unchanged(env, monkeypatch, fmt):
     assert "0:t?" not in _maps(cmd)
 
 
-def test_j5_webm_keeps_implicit_selection(env, monkeypatch):
+def test_j5_webm_maps_every_eligible_subtitle_as_webvtt(env, monkeypatch):
+    """WebM maps explicitly too now - into its own subtitle format.
+
+    Same absolute indexes and same source order as Matroska; only the output
+    codec differs, because WebVTT is the only subtitle format WebM carries.
+    """
     src, out_dir, fake = env
     _probe(monkeypatch, THREE_TEXT)
 
     assert _run(src, out_dir, fmt="WebM (VP9)")["status"] == "ok"
-    assert _maps(fake.mux_cmd) == []
-    assert build_stream_map_args("webm", THREE_TEXT) == []
+    assert _maps(fake.mux_cmd) == ["0:v:0", "0:a?", "0:3", "0:6", "0:9"]
+    assert fake.mux_cmd[fake.mux_cmd.index("-c:s") + 1] == "webvtt"
+    assert build_stream_map_args("webm", THREE_TEXT) == [
+        "-map", "0:v:0", "-map", "0:a?", "-map", "0:3", "-map", "0:6",
+        "-map", "0:9", "-c:s", "webvtt"]
 
 
 # ══ GROUP K — Tab 2b MP4 -> MKV fallback ═════════════════════════════════════

@@ -230,8 +230,14 @@ def test_a3_mp4_never_maps_or_copies_attachments(streams):
 
 
 def test_a4_webm_never_maps_or_copies_attachments():
+    """WebM maps explicitly now, and still names no attachment.
+
+    Attachments are Matroska's to preserve; WebM has no support for them, so
+    the explicit policy leaves them out by simply never naming them.
+    """
     args = build_stream_map_args("webm", [_sub(3, "subrip")])
-    assert args == []
+    assert args == ["-map", "0:v:0", "-map", "0:a?", "-map", "0:3",
+                    "-c:s", "webvtt"]
     assert not [m for m in _maps(args) if m.startswith("0:t")]
     assert "-c:t" not in args
 
