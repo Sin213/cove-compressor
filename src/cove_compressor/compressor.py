@@ -297,10 +297,18 @@ def _probe_amf(encoder: str) -> bool:
     if encoder not in (listing.stdout or ""):
         return False
 
+    # Compiled in — now confirm the hardware actually accepts it. The probe
+    # geometry has to be one AMF will really encode at: `hevc_amf` refuses to
+    # initialize on tiny frames (an RX 9070 XT answers 320x240 with
+    # "encoder->Init() failed with error 5" while encoding 720p HEVC happily),
+    # so a thumbnail-sized probe reported no HEVC on hardware that has it.
+    # One 1280x720 frame to the null muxer is representative of real work,
+    # costs ~0.2s, and touches neither disk nor the user's files.
     try:
         probe = subprocess.run(
             [FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
-             "-f", "lavfi", "-i", "color=c=black:s=320x240:r=10:d=0.3",
+             "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=1",
+             "-frames:v", "1",
              "-c:v", encoder, "-f", "null", os.devnull],
             capture_output=True, text=True, timeout=30,
             env=clean_subprocess_env(), **SUBPROCESS_FLAGS,
