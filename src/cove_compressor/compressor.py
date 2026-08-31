@@ -1494,6 +1494,29 @@ def _discard_reserved_output(output_path: Path) -> None:
             time.sleep(RESERVED_CLEANUP_RETRY_DELAY)
 
 
+def _final_output_is_present(path: Path) -> bool:
+    """Whether an apparently successful encode actually left a usable file.
+
+    The counterpart to `_discard_reserved_output`: that one reclaims a
+    reservation nothing filled, this one asks whether anything filled it. A
+    zero exit code says ffmpeg believed it finished, which is not the same as
+    a file existing - and because Cove reserves the destination up front, the
+    path exists either way. `exists()` therefore proves nothing on its own;
+    only a non-empty regular file distinguishes a finished encode from the
+    placeholder Cove created before ffmpeg ever ran.
+
+    Deliberately structural and nothing more. No ffprobe, no codec/duration/
+    stream check, no container parsing, and no size floor above zero: a short
+    low-bitrate encode is legitimately tiny, and any threshold would throw it
+    away. An unreadable path is unverified, and unverified fails closed.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return stat_mod.S_ISREG(st.st_mode) and st.st_size > 0
+
+
 # ── MP4 → MKV container fallback ─────────────────────────────────────────────
 #
 # MP4 is the one container Cove targets that can refuse a stream combination
@@ -1935,6 +1958,18 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
     # `os.replace`, not `rename`: the destination is the zero-byte placeholder
     # this job reserved, and on Windows `rename` refuses an existing target.
     os.replace(str(tmp_path), str(output_path))
+    # The last thing between "ffmpeg exited 0" and telling the user their
+    # video converted. Everything success-only hangs off this line - the ok
+    # result, sidecar finalization, and the source deletion those two make
+    # eligible - so a destination that is missing, empty, not a regular file
+    # or unreadable stops here rather than becoming a result somebody trusts.
+    # No `mux_failed` marker: a successful exit that produced nothing is a
+    # different anomaly from the ordinary mux failure the MKV retry exists
+    # for, and it stays terminal instead of widening that retry.
+    if not _final_output_is_present(output_path):
+        return {"file": input_path, "status": "error",
+                "msg": "FFmpeg reported success but no valid output file "
+                       "was created"}
     result = {"file": input_path, "output": output_path, "status": "ok",
               "original": original_size, "new": new_size, "encoder": encoder}
     # Sidecars are finalized only now, against a video output that exists.
