@@ -401,11 +401,16 @@ def test_e2_matroska_maps_audio_once_and_optionally():
     assert "0:a" not in maps, "a mandatory map breaks silent sources"
 
 
-def test_e3_matroska_maps_the_first_text_subtitle_by_absolute_index():
-    """Reproduces what ffmpeg's implicit selection used to do for us."""
+def test_e3_matroska_maps_every_text_subtitle_by_absolute_index():
+    """Absolute indexes, never subtitle-relative ones - and all of them.
+
+    Implicit selection took one text stream and dropped the rest; Matroska is
+    a multi-track container and has no reason to. See
+    `tests/test_mkv_multi_subtitles.py` for the full cardinality contract.
+    """
     args = build_matroska_stream_map_args([_sub(3, "subrip"),
                                            _sub(5, "ass")])
-    assert _maps(args) == ["0:v:0", "0:a?", "0:3", "0:t?"]
+    assert _maps(args) == ["0:v:0", "0:a?", "0:3", "0:5", "0:t?"]
     assert "-sn" not in args
 
 

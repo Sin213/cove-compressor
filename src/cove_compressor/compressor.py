@@ -851,10 +851,15 @@ def build_matroska_stream_map_args(
     Matroska's default encoder is text-based, so a bitmap track (PGS, VobSub,
     DVB, XSUB) used to be skipped and the file converted anyway. Naming
     `0:s:0?` instead would force that bitmap track into a text encoder and fail
-    the whole job, so the first *text* stream is named by absolute index and
-    nothing usable means `-sn`. `subtitle_streams` is None when discovery
-    failed, which disables subtitles outright rather than handing the choice
-    back to the implicit selection this policy exists to replace.
+    the whole job, so every *text* stream is named by absolute index instead.
+    Every one, not just the first: Matroska is a multi-track container, and a
+    film with English, Japanese and Spanish subtitles has no reason to arrive
+    with two of them missing. Ineligible streams are skipped *around* the
+    eligible ones rather than ending the scan, source order is the inventory's
+    order, and nothing usable at all still means `-sn`. `subtitle_streams` is
+    None when discovery failed, which disables subtitles outright rather than
+    handing the choice back to the implicit selection this policy exists to
+    replace.
 
     Audio is mapped by type (`0:a?`), so every source audio stream survives in
     source order - a multi-language film keeps all of its tracks. Audio and
@@ -868,9 +873,9 @@ def build_matroska_stream_map_args(
     args = ["-map", "0:v:0", "-map", "0:a?"]
     indexes = ([] if subtitle_streams is None
                else matroska_mappable_subtitle_indexes(subtitle_streams))
-    if indexes:
-        args += ["-map", f"0:{indexes[0]}"]
-    else:
+    for idx in indexes:
+        args += ["-map", f"0:{idx}"]
+    if not indexes:
         args += ["-sn"]
     return args + ["-map", "0:t?", "-c:t", "copy"]
 

@@ -754,10 +754,11 @@ def test_i1_matroska_still_maps_and_copies_attachments():
     assert args[args.index("-c:t") + 1] == "copy"
 
 
-def test_i2_matroska_still_names_the_first_text_subtitle():
+def test_i2_matroska_still_names_its_text_subtitles_by_absolute_index():
+    """The bitmap stream is skipped; both text streams are kept."""
     args = build_matroska_stream_map_args(
         [_sub(2, "hdmv_pgs_subtitle"), _sub(4, "subrip"), _sub(6, "ass")])
-    assert _maps(args) == ["0:v:0", "0:a?", "0:4", "0:t?"]
+    assert _maps(args) == ["0:v:0", "0:a?", "0:4", "0:6", "0:t?"]
 
 
 def test_i3_matroska_without_usable_subtitles_still_says_sn():

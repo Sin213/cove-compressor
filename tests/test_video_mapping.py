@@ -285,10 +285,10 @@ def test_mkv_maps_explicitly_without_the_mp4_policy(env, monkeypatch):
     """MP4's *policy* must not leak into MKV, even though MKV now maps too.
 
     Both containers map explicitly and share the one subtitle probe, but they
-    do different things with it. Matroska names a single text subtitle by
-    absolute index and lets ffmpeg's default text encoder handle it; MP4 names
-    every compatible stream and transcodes to `mov_text`. The `mov_text`
-    codec argument is the part that must never appear here.
+    do different things with it. Both name every compatible stream by absolute
+    index, but Matroska lets ffmpeg's default text encoder handle them and
+    also maps attachments, where MP4 transcodes to `mov_text` and maps none.
+    The `mov_text` codec argument is the part that must never appear here.
     """
     src, out_dir, fake = env
     _probe(monkeypatch, [_sub(3, "subrip")])
