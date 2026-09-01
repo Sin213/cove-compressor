@@ -1298,6 +1298,13 @@ def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
     # arrive downstream looking like an ordinary mux failure. This is a single
     # latched line, not a transcript: retention stays O(the existing window).
     no_space_line: str | None = None
+    # Which `Metadata:` block, if any, each retained line sat inside. ffmpeg
+    # quotes the user's own tags back at it, and a title may legitimately read
+    # "No space left on device" - so what a line *is* has to be decided while
+    # the block that framed it is still in view. Same window as the tail it
+    # annotates: one header reference per retained line, no transcript.
+    metadata = _MetadataBlockTracker()
+    stderr_provenance: deque = deque(maxlen=40)
     stderr_queue: queue.Queue = queue.Queue()
     assert proc.stderr is not None
 
@@ -1344,10 +1351,15 @@ def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
             eof_received = True
         elif line:
             stderr_tail.append(line.rstrip())
+            echoed_metadata = metadata.feed(line)
+            stderr_provenance.append(metadata.quoted_under)
             # Same predicate the failure classifier uses, asked here while the
-            # line is still in hand. Latched once: later lines can only add
-            # chatter, never unsay a disk that filled up.
-            if no_space_line is None and _is_no_space_failure(line):
+            # line is still in hand - and while the block it belongs to is
+            # still known, which a single line can never say for itself.
+            # Latched once: later lines can only add chatter, never unsay a
+            # disk that filled up.
+            if (no_space_line is None and not echoed_metadata
+                    and _is_no_space_failure(line)):
                 no_space_line = line.rstrip()
             progress_time = parse_ffmpeg_time(line)
             if progress_time is not None:
@@ -1370,6 +1382,15 @@ def run_ffmpeg(cmd: list, cancel_flag: threading.Event,
             break
 
     tail = list(stderr_tail)[-5:]
+    # The tail is cut by line count, not by structure, so it can open partway
+    # through a metadata block - leaving quoted tag values with nothing left
+    # in view to say they are quoted tag values. When that would change the
+    # answer, the block's own header goes back in front of them: one real
+    # ffmpeg line, restoring context the truncation removed rather than
+    # inventing any. Read-only otherwise, so an ordinary tail is untouched.
+    open_header = (list(stderr_provenance)[-5:] or [None])[0]
+    if open_header is not None and _is_no_space_failure("\n".join(tail)):
+        tail = [open_header] + tail
     # A failure that ffmpeg blamed on space keeps saying so. If the tail has
     # already scrolled past that line, it goes back in front of it - one extra
     # line, on the one failure that needs it, so the tail itself keeps its
@@ -1574,17 +1595,111 @@ NO_SPACE_SIGNALS = ("no space left on device", "enospc")
 _FFMPEG_PATH_ANNOUNCEMENT = re.compile(
     r"(?:Input #\d+, [^']*, from |Output #\d+, [^']*, to )'.*':$")
 
+# The other half of what ffmpeg quotes back before it says anything of its own:
+# the container's tags. Captured verbatim from the 8.1.1 build this project
+# ships against, over media deliberately tagged with the recognized phrases:
+#
+#     Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'signal.mp4':
+#       Metadata:
+#         compatible_brands: isomiso2avc1mp41
+#         title           : No space left on device
+#         comment         : ENOSPC
+#       Duration: 00:00:02.00, start: 0.000000, bitrate: 122 kb/s
+#       Stream #0:0[0x1](und): Video: h264 ...
+#         Metadata:
+#           handler_name    : VideoHandler
+#
+# A block opens on an indented bare `Metadata:` (2 spaces for a container, 4
+# for a stream, 6 for a chapter) and its values sit one level deeper. Nothing
+# else in the report is shaped that way, and ffmpeg's own complaints are
+# unindented - so the block closes on the first line back at or left of its
+# header, which is every real terminator: `Duration:`, `Stream #`, `Chapters:`,
+# `Side data:`, the next `Input #`/`Output #`, `Conversion failed!`.
+#
+# What makes a value line is the padded key column, not the punctuation in the
+# key. Two real shapes the obvious pattern misses, both reachable from a file a
+# user can hand this program:
+#
+#     WEIRD:KEY       : ENOSPC          a tag name may contain a colon
+#     COMMENT         : first line      a tag value may contain newlines, and
+#                     : ENOSPC          its continuations have a blank key
+#
+# The value pattern is required as well as the indentation. Excluding too
+# little only restores the predecessor's behaviour; excluding too much would
+# hide a real full disk, which is the failure this whole path exists to report.
+_FFMPEG_METADATA_HEADER = re.compile(r"^(\s{2,})Metadata:$")
+_FFMPEG_METADATA_VALUE = re.compile(r"^(\s+)\S* *:(?: |$)")
+
+# The one prefix Cove itself adds before a message reaches the classifier.
+_FFMPEG_FAILURE_PREFIX = "ffmpeg failed: "
+
+
+class _MetadataBlockTracker:
+    """Line-by-line provenance for ffmpeg's `Metadata:` blocks.
+
+    State is one indent and one header line - bounded, and created per
+    subprocess, so nothing survives an attempt, a fallback or a file.
+    """
+
+    __slots__ = ("_indent", "_header", "_opened")
+
+    def __init__(self) -> None:
+        self._indent: int | None = None
+        self._header: str | None = None
+        self._opened = False
+
+    @property
+    def quoted_under(self) -> str | None:
+        """The header framing the line just fed, if it sat inside a block.
+
+        Asked of every retained line rather than only of recognized values, so
+        that restoring a truncated tail depends on the block being open and not
+        on the shape of whichever line the tail happens to begin with.
+        """
+        return None if self._opened else self._header
+
+    def feed(self, line: str) -> bool:
+        """Consume one stderr line; True if it is an echoed metadata value."""
+        stripped = line.rstrip()
+        self._opened = False
+        header = _FFMPEG_METADATA_HEADER.match(stripped)
+        if header is not None:
+            self._indent = len(header.group(1))
+            self._header = stripped
+            self._opened = True
+            return False
+        if self._indent is None:
+            return False
+        value = _FFMPEG_METADATA_VALUE.match(stripped)
+        if value is not None and len(value.group(1)) > self._indent:
+            return True
+        if len(stripped) - len(stripped.lstrip()) <= self._indent:
+            self._indent = None
+            self._header = None
+        return False
+
 
 def _is_no_space_failure(msg: str | None) -> bool:
     """Whether ffmpeg blamed this failure on space, judged line by line.
 
     Each line is classified with the path it announced removed, rather than
     skipped outright: a line is only ever partly an announcement, so anything
-    ffmpeg said around one - including the "ffmpeg failed:" prefix this message
-    may already carry - still counts. Matching is otherwise the predecessor's:
-    lowercase substring, anywhere, over exactly the committed vocabulary.
+    ffmpeg said around one still counts. Lines ffmpeg was quoting rather than
+    complaining - the values inside a metadata block - are not diagnostics at
+    all and are passed over, which is provenance, not a rule about colons or
+    indentation: the same shapes outside a block still classify. Matching is
+    otherwise the predecessor's: lowercase substring, anywhere, over exactly
+    the committed vocabulary.
     """
-    for line in (msg or "").splitlines():
+    text = msg or ""
+    # Stripped so a re-inserted block header still reads as one after
+    # `compress_video` has labelled the message.
+    if text.startswith(_FFMPEG_FAILURE_PREFIX):
+        text = text[len(_FFMPEG_FAILURE_PREFIX):]
+    metadata = _MetadataBlockTracker()
+    for line in text.splitlines():
+        if metadata.feed(line):
+            continue
         lowered = _FFMPEG_PATH_ANNOUNCEMENT.sub("", line.rstrip()).lower()
         if any(signal in lowered for signal in NO_SPACE_SIGNALS):
             return True
@@ -1981,7 +2096,7 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
         if tmp_path.exists():
             tmp_path.unlink()
         result = {"file": input_path, "status": "error",
-                  "msg": f"ffmpeg failed: {err}"}
+                  "msg": f"{_FFMPEG_FAILURE_PREFIX}{err}"}
         if rc > 0:
             # An ordinary nonzero exit from the *final* encode/mux invocation
             # - single-pass, or pass 2 of two-pass. At this layer an encoder
