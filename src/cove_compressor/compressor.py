@@ -1559,6 +1559,50 @@ def _final_output_is_present(path: Path) -> bool:
     return stat_mod.S_ISREG(st.st_mode) and st.st_size > 0
 
 
+# A validation step that can outlive the encode it validates is a worse bug
+# than the one it fixes. The same bound the source probes already use: long
+# enough that no honest file misses it, short enough to stay a step.
+FINAL_READABILITY_TIMEOUT = 30
+
+
+def _final_output_is_readable(path: Path,
+                              cancel_flag: threading.Event | None = None
+                              ) -> bool:
+    """Whether ffprobe can open the finished file as media.
+
+    `_final_output_is_present` proves a file arrived; this proves something is
+    in it. They are different questions and the second one cannot be answered
+    from metadata: a successful ffmpeg exit that leaves a kilobyte of noise at
+    the destination is structurally indistinguishable from a short valid
+    encode, and Cove would report it as a conversion, finalize its sidecars,
+    and offer to delete the original that was the only readable copy.
+
+    Readability is the exit code and nothing else. Duration, stream counts,
+    codecs and container names are all separate policies, each with its own
+    false rejections - a legitimately odd but playable file must not be thrown
+    away here - so nothing this probe could print is read. `-v error` keeps
+    the run quiet; the verdict is `returncode == 0`.
+
+    Fails closed on every way the check itself can fail: a missing or
+    unlaunchable ffprobe, a timeout, or a cancellation landing either side of
+    the run. An unverified output is not a verified one.
+    """
+    if cancel_flag is not None and cancel_flag.is_set():
+        return False
+    try:
+        r = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", str(path)],
+            capture_output=True, text=True,
+            timeout=FINAL_READABILITY_TIMEOUT,
+            env=clean_subprocess_env(), **SUBPROCESS_FLAGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if cancel_flag is not None and cancel_flag.is_set():
+        return False
+    return r.returncode == 0
+
+
 # ── MP4 → MKV container fallback ─────────────────────────────────────────────
 #
 # MP4 is the one container Cove targets that can refuse a stream combination
@@ -1765,6 +1809,17 @@ def compress_video(
     are pulled to sidecars *before* the encode begins (the encode is what
     destroys access to them) and only finalized once the video itself lands.
     """
+    # ffprobe is a dependency of every video conversion, not of the two modes
+    # that happen to read a duration with it. The finished file is validated
+    # with ffprobe before any success is reported, so a machine that cannot
+    # run it cannot produce a successful conversion in any mode - and the
+    # honest place to say so is before the encode, not after it. The
+    # application blocks this at its start boundary; this is the same refusal
+    # for anything that calls the core directly.
+    if not shutil.which(FFPROBE_BIN):
+        return {"file": input_path, "status": "error",
+                "msg": "ffprobe is required for video compression."}
+
     fmt = VIDEO_FORMATS[video_format_key]
     encoder    = fmt["codec"]
     codec_key  = fmt["codec_key"]
@@ -2132,6 +2187,23 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
         return {"file": input_path, "status": "error",
                 "msg": "FFmpeg reported success but no valid output file "
                        "was created"}
+    # ...and a file with bytes in it is not yet a video. Second and last: can
+    # ffprobe open what was produced? Only a path that got this far is worth
+    # probing - a missing, empty, non-regular or unstatable one has already
+    # failed above, and a failed encode returned long before either gate.
+    # Like the structural check this is deliberately terminal: an apparent
+    # success whose bytes are not media is a different anomaly from the mux
+    # failure the MP4 -> MKV retry exists for, so it carries no `mux_failed`
+    # marker and earns no second encode.
+    if not _final_output_is_readable(output_path, cancel_flag):
+        if cancel_flag.is_set():
+            # The flag landed between ffmpeg exiting and the gate running.
+            # A cancelled job is not a successful conversion whatever the
+            # bytes would have probed as.
+            return {"file": input_path, "status": "error", "msg": "cancelled"}
+        return {"file": input_path, "status": "error",
+                "msg": "The output file could not be verified as readable "
+                       "media"}
     result = {"file": input_path, "output": output_path, "status": "ok",
               "original": original_size, "new": new_size, "encoder": encoder}
     # Sidecars are finalized only now, against a video output that exists.

@@ -178,6 +178,10 @@ def env(tmp_path, monkeypatch):
 
     fake = FakeFfmpeg()
     monkeypatch.setattr(compressor, "run_ffmpeg", fake)
+    # The encoder is faked, so nothing it "writes" is real media. The final
+    # readability gate is a separate contract with its own suite.
+    monkeypatch.setattr(compressor, "_final_output_is_readable",
+                        lambda path, cancel_flag=None: True)
     monkeypatch.setattr(compressor, "ffprobe_duration", lambda p: DURATION)
     monkeypatch.setattr(compressor, "nvenc_available", lambda e="hevc_nvenc": False)
     monkeypatch.setattr(compressor, "amf_available", lambda e="hevc_amf": True)

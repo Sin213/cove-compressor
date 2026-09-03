@@ -134,6 +134,11 @@ class FakeFfmpeg:
 
 def _fake_stack(monkeypatch, fake):
     monkeypatch.setattr(compressor, "run_ffmpeg", fake)
+    # The encoder is faked, so nothing it "writes" is real media. Tab 18's
+    # readability gate is a separate contract with its own suite; this one is
+    # about the structural question that comes before it.
+    monkeypatch.setattr(compressor, "_final_output_is_readable",
+                        lambda path, cancel_flag=None: True)
     monkeypatch.setattr(compressor, "ffprobe_duration", lambda p: 10.0)
     monkeypatch.setattr(
         compressor, "ffprobe_stream_inventory",

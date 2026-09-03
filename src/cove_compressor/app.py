@@ -1891,6 +1891,20 @@ class MainWindow(QMainWindow):
                 "Install it or place ffmpeg / ffprobe binaries next to the app.",
             )
             return
+        # ffprobe is no longer a target-mode dependency. Every finished video
+        # is validated with it before Cove calls the conversion successful, so
+        # without it no mode can produce a successful conversion - Quality
+        # preset included, which is the default and used to be exempt. This is
+        # the one place a video batch can begin, so it is the one place the
+        # refusal has to live; better here than after a long encode.
+        if not shutil.which(FFPROBE_BIN):
+            QMessageBox.warning(
+                self, APP_NAME,
+                "ffprobe not found.\n\n"
+                "ffprobe is required for video compression.\n"
+                "Install it or place ffmpeg / ffprobe binaries next to the app.",
+            )
+            return
 
         files = self._collect_from_queue(self.vid_queue, "video")
         if not files:
@@ -1900,19 +1914,13 @@ class MainWindow(QMainWindow):
         if not output_dir:
             return
 
+        # No per-mode ffprobe check: the gate above covers every mode, and a
+        # second copy of the same policy is a second thing that can drift.
         mode = self.vid_mode.currentText()
         if mode == "Target file size":
             mode_value = float(self.vid_size_mb.value())
-            if not shutil.which(FFPROBE_BIN):
-                QMessageBox.warning(self, APP_NAME,
-                                    "ffprobe required for target size mode.")
-                return
         elif mode == "Target reduction":
             mode_value = float(self.vid_pct.value())
-            if not shutil.which(FFPROBE_BIN):
-                QMessageBox.warning(self, APP_NAME,
-                                    "ffprobe required for target reduction mode.")
-                return
         else:
             mode_value = self.vid_quality.currentText()
 
