@@ -1581,28 +1581,50 @@ FINAL_READABILITY_TIMEOUT = 30
 # failing, and is treated like a launch failure or a timeout: preserve.
 _FFPROBE_REFUSAL_STATUS = 1
 
+# What turns the readability probe into a *video* readability probe, without
+# turning it into a second process.
+#
+# `-select_streams v:0` narrows the report to the first video stream and
+# `stream=index` asks for the one field every stream has, so the answer is the
+# smallest thing ffprobe can be made to say: `csv=p=0` prints the bare index on
+# stdout when a video stream exists and prints nothing at all when none does.
+# Measured against the real binary on audio-only MP4/MKV/WebM built by ffmpeg
+# itself, every one exits 0 with empty stdout; the same containers carrying
+# picture exit 0 and print an index.
+#
+# Deliberately `v:0` and not `v`: one line is all the evidence "at least one"
+# needs, and asking for the whole list would invite counting it. Tab 20 is a
+# presence rule, not a parity rule.
+_FFPROBE_VIDEO_STREAM_ARGS = ("-select_streams", "v:0",
+                              "-show_entries", "stream=index",
+                              "-of", "csv=p=0")
+
 
 class _Readability:
-    """The verdict of one final readability probe.
+    """The verdict of one final probe of a finished artifact.
 
-    Three outcomes, not two, because "not readable" collapses two facts that
-    are not the same fact. ffprobe running to completion and exiting nonzero is
-    evidence about the *bytes*: they are not media. ffprobe failing to launch,
-    timing out, or a cancellation landing mid-check is evidence about the
-    *probe*: the artifact may be perfectly good video that Cove merely failed
-    to verify. Both fail the conversion closed and both keep the source; only
-    the first may be acted on destructively.
+    Four outcomes, not two, because "not readable" collapses facts that are not
+    the same fact. ffprobe running to completion and exiting nonzero is evidence
+    about the *bytes*: they are not media. ffprobe parsing the file and finding
+    no video stream in it is evidence about the *content*: they are media, and
+    they are not a video. ffprobe failing to launch, timing out, or a
+    cancellation landing mid-check is evidence about the *probe*: the artifact
+    may be perfectly good video that Cove merely failed to verify. All three
+    fail the conversion closed and all three keep the source; only the first two
+    are verdicts about the file, and only they may be acted on destructively.
 
-    Falsy unless readable, so every `if not ...` caller - and the suites that
-    stub this seam with a plain `True` - keep working unchanged. The extra
-    distinction is read in exactly one place, where cleanup is decided.
+    Falsy unless the file is media *and* carries picture, so every `if not ...`
+    caller - and the suites that stub this seam with a plain `True` - keep
+    working unchanged. The extra distinctions are read in exactly one place,
+    where cleanup and the user's error message are decided.
     """
 
-    __slots__ = ("readable", "rejected")
+    __slots__ = ("readable", "rejected", "no_video")
 
-    def __init__(self, readable: bool, rejected: bool):
+    def __init__(self, readable: bool, rejected: bool, no_video: bool = False):
         self.readable = readable
         self.rejected = rejected      # ffprobe finished and said no
+        self.no_video = no_video      # ...and said so by finding no picture
 
     def __bool__(self) -> bool:
         return self.readable
@@ -1610,26 +1632,41 @@ class _Readability:
 
 _READABLE = _Readability(readable=True, rejected=False)
 _REJECTED = _Readability(readable=False, rejected=True)
+# Media, and not a video. A verdict about the artifact exactly as `_REJECTED`
+# is, so it carries the same destructive licence - it is only told apart to say
+# something true to the user, because "could not be verified as readable media"
+# would send them debugging bytes that are perfectly fine.
+_NO_VIDEO = _Readability(readable=False, rejected=True, no_video=True)
 _INCONCLUSIVE = _Readability(readable=False, rejected=False)
 
 
 def _final_output_is_readable(path: Path,
                               cancel_flag: threading.Event | None = None
                               ) -> _Readability:
-    """Whether ffprobe can open the finished file as media.
+    """Whether ffprobe can open the finished file as media *containing video*.
 
-    `_final_output_is_present` proves a file arrived; this proves something is
-    in it. They are different questions and the second one cannot be answered
-    from metadata: a successful ffmpeg exit that leaves a kilobyte of noise at
-    the destination is structurally indistinguishable from a short valid
-    encode, and Cove would report it as a conversion, finalize its sidecars,
-    and offer to delete the original that was the only readable copy.
+    `_final_output_is_present` proves a file arrived; this proves a video is in
+    it. They are different questions and the second one cannot be answered from
+    metadata: a successful ffmpeg exit that leaves a kilobyte of noise at the
+    destination is structurally indistinguishable from a short valid encode,
+    and Cove would report it as a conversion, finalize its sidecars, and offer
+    to delete the original that was the only readable copy.
 
-    Readability is the exit code and nothing else. Duration, stream counts,
-    codecs and container names are all separate policies, each with its own
-    false rejections - a legitimately odd but playable file must not be thrown
-    away here - so nothing this probe could print is read. `-v error` keeps
-    the run quiet; the verdict is `returncode == 0`.
+    Being media is not enough, because an exit code answers "are these bytes
+    parseable?" and for a *video compressor* that question comes apart from the
+    one that matters at exactly one place. An audio-only container is media:
+    ffprobe opens it, parses it, and exits 0. It is also not the thing the user
+    asked for, and every success-only consequence would fire behind that 0 -
+    including the offer to delete the only copy of the picture. So the same
+    invocation is asked for one more fact, `_FFPROBE_VIDEO_STREAM_ARGS`, and
+    both are read off it: the exit code says whether this is media, and stdout
+    says whether any of it is video.
+
+    That pair is the whole policy. Duration, video/audio/subtitle counts,
+    codecs, resolution and container names are all separate policies, each with
+    its own false rejections - a legitimately odd but playable file must not be
+    thrown away here - so the printed index is weighed only for existing. One
+    stream is enough and five are equally fine.
 
     Fails closed on every way the check itself can fail: a missing or
     unlaunchable ffprobe, a timeout, or a cancellation landing either side of
@@ -1642,7 +1679,8 @@ def _final_output_is_readable(path: Path,
         return _INCONCLUSIVE
     try:
         r = subprocess.run(
-            [FFPROBE_BIN, "-v", "error", str(path)],
+            [FFPROBE_BIN, "-v", "error", *_FFPROBE_VIDEO_STREAM_ARGS,
+             str(path)],
             capture_output=True, text=True,
             timeout=FINAL_READABILITY_TIMEOUT,
             env=clean_subprocess_env(), **SUBPROCESS_FLAGS,
@@ -1651,16 +1689,22 @@ def _final_output_is_readable(path: Path,
         return _INCONCLUSIVE
     if cancel_flag is not None and cancel_flag.is_set():
         return _INCONCLUSIVE
-    if r.returncode == 0:
-        return _READABLE
-    # ffprobe has exactly one way of refusing a file, and any other status is
-    # the probe dying rather than answering - a POSIX signal death, or a
-    # Windows crash, which can be a large number (0xC0000005 arrives as
-    # 3221225477) or a small one (an aborted CRT process exits 3). A death says
-    # exactly as much about the bytes as a launch failure or a timeout does, so
-    # it is classed with them and the artifact is kept.
-    return (_REJECTED if r.returncode == _FFPROBE_REFUSAL_STATUS
-            else _INCONCLUSIVE)
+    if r.returncode != 0:
+        # ffprobe has exactly one way of refusing a file, and any other status
+        # is the probe dying rather than answering - a POSIX signal death, or a
+        # Windows crash, which can be a large number (0xC0000005 arrives as
+        # 3221225477) or a small one (an aborted CRT process exits 3). A death
+        # says exactly as much about the bytes as a launch failure or a timeout
+        # does, so it is classed with them and the artifact is kept. Whatever a
+        # failing probe managed to print is not evidence of anything and is not
+        # read: stdout only means something once the exit code says this is
+        # media at all.
+        return (_REJECTED if r.returncode == _FFPROBE_REFUSAL_STATUS
+                else _INCONCLUSIVE)
+    # Media. Now: is any of it picture? A printed stream index is the evidence,
+    # and the only evidence - stripped first, because "no video stream" arrives
+    # as empty output that a trailing newline would otherwise make look full.
+    return _READABLE if (r.stdout or "").strip() else _NO_VIDEO
 
 
 def _discard_rejected_output(output_path: Path) -> None:
@@ -2286,13 +2330,13 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
                 "msg": "FFmpeg reported success but no valid output file "
                        "was created"}
     # ...and a file with bytes in it is not yet a video. Second and last: can
-    # ffprobe open what was produced? Only a path that got this far is worth
-    # probing - a missing, empty, non-regular or unstatable one has already
-    # failed above, and a failed encode returned long before either gate.
-    # Like the structural check this is deliberately terminal: an apparent
-    # success whose bytes are not media is a different anomaly from the mux
-    # failure the MP4 -> MKV retry exists for, so it carries no `mux_failed`
-    # marker and earns no second encode.
+    # ffprobe open what was produced, and is there picture in it? Only a path
+    # that got this far is worth probing - a missing, empty, non-regular or
+    # unstatable one has already failed above, and a failed encode returned
+    # long before either gate. Like the structural check this is deliberately
+    # terminal: an apparent success that is not a video is a different anomaly
+    # from the mux failure the MP4 -> MKV retry exists for, so it carries no
+    # `mux_failed` marker and earns no second encode.
     verdict = _final_output_is_readable(output_path, cancel_flag)
     if not verdict:
         if cancel_flag.is_set():
@@ -2302,17 +2346,20 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
             # not Cove's to throw away, so it stays exactly where it is.
             return {"file": input_path, "status": "error", "msg": "cancelled"}
         if verdict.rejected:
-            # ffprobe launched, finished, and refused these bytes. That is a
-            # verdict about the artifact rather than about the probe, so the
-            # file Cove reserved and filled - and is about to disown - goes
-            # with it. A probe that never got to answer (unlaunchable,
-            # timed out) reaches here too and deliberately does not: it may
-            # have been a good video, and deleting an output Cove merely
-            # failed to verify is the larger mistake of the two.
+            # ffprobe launched, finished, and either refused these bytes or
+            # found no video in them. Either way that is a verdict about the
+            # artifact rather than about the probe, so the file Cove reserved
+            # and filled - and is about to disown - goes with it. A probe that
+            # never got to answer (unlaunchable, timed out) reaches here too
+            # and deliberately does not: it may have been a good video, and
+            # deleting an output Cove merely failed to verify is the larger
+            # mistake of the two.
             _discard_rejected_output(output_path)
         return {"file": input_path, "status": "error",
-                "msg": "The output file could not be verified as readable "
-                       "media"}
+                "msg": ("The output file contains no video stream"
+                        if verdict.no_video else
+                        "The output file could not be verified as readable "
+                        "media")}
     result = {"file": input_path, "output": output_path, "status": "ok",
               "original": original_size, "new": new_size, "encoder": encoder}
     # Sidecars are finalized only now, against a video output that exists.

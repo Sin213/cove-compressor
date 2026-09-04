@@ -7,11 +7,18 @@ noise at the destination passes that gate intact: Cove reports the conversion
 as ok, finalizes its sidecars, and - with delete-source enabled - removes the
 original, which was the only readable copy.
 
-So one more question gets asked, and only one: can ffprobe open the finished
-file as media? Not how long it is, not what codecs are in it, not how many
-streams it carries - those are semantic policies with their own failure
-modes, and every one of them would eventually reject a file that plays. The
-gate here is `ffprobe -v error <output>` and its exit code, nothing else.
+So one more question gets asked: can ffprobe open the finished file as media?
+Not how long it is, not what codecs are in it, not how many streams it
+carries - those are semantic policies with their own failure modes, and every
+one of them would eventually reject a file that plays.
+
+(Tab 20 later added exactly one more fact to the same single invocation -
+whether *any* video stream exists - because for a video compressor "parseable
+media" and "a video" are not the same claim. The command grew
+`-select_streams v:0 -show_entries stream=index -of csv=p=0`; the exit code
+still decides readability, and the printed index is weighed only for
+existing. Everything this suite says about duration, codecs, resolution and
+stream *counts* remains true, and Group K now guards that narrowed line.)
 
 That makes ffprobe a hard dependency of every video conversion rather than a
 target-mode one, in both places that can start an encode: the application
@@ -31,7 +38,8 @@ cannot route around it.
   H.   Sidecars are not finalized behind an unreadable video.
   I/J. The collision-resolved path is what gets probed, never the requested
        one.
-  K.   Readability is the exit code and nothing else.
+  K.   Readability is the exit code, and the probe asks for nothing beyond
+       the one video-stream index Tab 20 needs.
   L.   A missing ffprobe fails the core closed, before any encode.
   M.   Nothing is remembered between files.
   N.   The result dict grows no probe internals.
@@ -732,17 +740,17 @@ def test_j_fallback_collision_resolved_output_is_what_is_probed(env,
     assert sentinel.read_bytes() == b"the user's own mkv"
 
 
-# ══ GROUP K — readability is the exit code and nothing else ═══════════════
+# ══ GROUP K — readability is the exit code, and the probe stays minimal ═══
 
-def test_k1_a_probe_that_exits_zero_is_accepted_whatever_it_printed(env):
-    """Zero streams, zero duration, a format name nobody recognizes: if
-    ffprobe opened the file, the file opened. Every semantic check beyond
-    that is a separate policy with its own false rejections, and none of them
-    are in this slice."""
+def test_k1_a_probe_that_exits_zero_is_accepted_whatever_else_it_printed(env):
+    """Zero duration, an unrecognized format name, a codec Cove never emits:
+    if ffprobe opened the file and reported a video stream, the file opened.
+    Every semantic check beyond that pair is a separate policy with its own
+    false rejections, and none of them are in this slice."""
     src, out_dir, fake, spy = env
     fake.payloads = [GARBAGE]
-    spy.result = (0, '{"streams": [], "format": {"duration": "0.000000", '
-                     '"format_name": "utterly unexpected"}}', "")
+    spy.result = (0, "0\nduration=0.000000\nformat_name=utterly unexpected\n",
+                  "")
 
     result = _run(src, out_dir)
 
@@ -762,20 +770,26 @@ def test_k2_a_probe_that_exits_nonzero_is_rejected_however_quiet(env,
     assert src.exists()
 
 
-def test_k3_the_probe_asks_for_no_output_semantics(env, real_media):
-    """The command itself is the contract: anything that requests stream,
-    format or frame data is a semantic check waiting to grow teeth."""
+def test_k3_the_probe_asks_for_nothing_beyond_a_video_stream_index(env,
+                                                                   real_media):
+    """The command itself is the contract. Tab 20 bought exactly one fact from
+    it - does a video stream exist - and anything that requests format, frame
+    or packet data, or the full stream dump, is a further semantic check
+    waiting to grow teeth."""
     src, out_dir, fake, spy = env
     fake.payloads = [real_media[".mp4"]]
 
     result = _run(src, out_dir)
 
     assert spy.count == 1
-    argv = spy.cmds[0]
-    for banned in ("-show_entries", "-show_streams", "-show_format",
-                   "-show_packets", "-show_frames", "-count_frames",
-                   "-count_packets", "-print_format", "-of"):
+    argv = [str(a) for a in spy.cmds[0]]
+    for banned in ("-show_streams", "-show_format", "-show_packets",
+                   "-show_frames", "-count_frames", "-count_packets",
+                   "-show_data", "-show_chapters", "-show_programs"):
         assert banned not in argv, f"{banned} is a semantic check"
+    # The one entry Tab 20 is allowed to ask for, and no other.
+    assert argv.count("-show_entries") == 1
+    assert argv[argv.index("-show_entries") + 1] == "stream=index"
     assert argv[-1] == str(result["output"])
 
 
