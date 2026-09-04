@@ -308,27 +308,31 @@ def test_a3_unreadable_output_leaves_no_success_side_effects(env, monkeypatch):
     assert _names(out_dir, "*.srt") == []
 
 
-def test_a4_the_unreadable_artifact_is_left_where_cleanup_leaves_it(env):
-    """Cove's failed-output cleanup reclaims the *empty* reservation it made,
-    and deliberately declines anything with bytes in it: it cannot prove
-    those bytes are its own, and deleting another writer's file is the worse
-    mistake. An unreadable artifact is therefore left on disk rather than
-    removed - never reported as an output, never a success, never a reason to
-    delete the source. Changing that cleanup model is a redesign, and not
-    this slice; this test exists so the choice stays visible."""
+def test_a4_the_unreadable_artifact_is_removed(env):
+    """Tab 18 left this artifact on disk: the generic failed-output cleanup
+    reclaims only the *empty* reservation it made and declines anything with
+    bytes in it, because it cannot prove those bytes are its own.
+
+    Tab 19 supplies that proof for this one case. `reserve_output` claimed
+    this exact path with O_CREAT|O_EXCL, the encode filled that same claimed
+    path, and ownership never passed to the user - so a probe that ran to
+    completion and refused the file is licence to remove it. The generic
+    guard is unchanged; see `test_unreadable_output_cleanup.py` for the full
+    contract, including the validator failures that are *not* licence."""
     src, out_dir, fake, spy = env
     fake.payloads = [GARBAGE]
 
     result = _run(src, out_dir)
 
     assert result["status"] == "error"
-    assert (out_dir / "Movie.mp4").read_bytes() == GARBAGE
-    assert "output" not in result, "on disk, but never handed to a caller"
+    assert not (out_dir / "Movie.mp4").exists()
+    assert "output" not in result, "removed, and never handed to a caller"
 
 
 def test_a5_a_neighbouring_file_survives_an_unreadable_conversion(env):
     """`Movie.mp4` is the user's, so this job reserved `Movie_1.mp4`. Failing
-    the readability gate may touch neither."""
+    the readability gate may touch only the second of those - the one Cove
+    claimed, filled, and never handed over."""
     src, out_dir, fake, spy = env
     neighbor = out_dir / "Movie.mp4"
     neighbor.write_bytes(b"the user's own file")
@@ -338,7 +342,8 @@ def test_a5_a_neighbouring_file_survives_an_unreadable_conversion(env):
 
     assert result["status"] == "error"
     assert neighbor.read_bytes() == b"the user's own file"
-    assert _names(out_dir) == ["Movie.mp4", "Movie_1.mp4"]
+    assert _names(out_dir) == ["Movie.mp4"], \
+        "the reserved artifact goes; the neighbour it collided with stays"
 
 
 # ══ GROUP B — real media through the real gate ══════════════════════════════

@@ -1564,10 +1564,58 @@ def _final_output_is_present(path: Path) -> bool:
 # enough that no honest file misses it, short enough to stay a step.
 FINAL_READABILITY_TIMEOUT = 30
 
+# The one status that means "ffprobe read this file and refuses it".
+#
+# ffprobe funnels every internal failure into a single `ret < 0` at the end of
+# main, so it has exactly one way of saying no, and it is this. Measured
+# against the real binary on garbage bytes, an empty file, ASCII text, 4 KB of
+# zeros, a truncated MP4, a missing path and a directory: every one exits 1,
+# and only a genuinely readable file exits 0.
+#
+# Matching that single value rather than a range is what keeps a *crash* from
+# being read as a verdict. Process death arrives as a number too, and on
+# Windows it can be a small one - the CRT terminates an `abort()`ed process
+# with status 3, and ffmpeg's `av_assert0` aborts - so any rule of the form
+# "nonzero" or "1..255" would delete an artifact that ffprobe never actually
+# judged. Anything that is neither 0 nor 1 is the probe failing, not the file
+# failing, and is treated like a launch failure or a timeout: preserve.
+_FFPROBE_REFUSAL_STATUS = 1
+
+
+class _Readability:
+    """The verdict of one final readability probe.
+
+    Three outcomes, not two, because "not readable" collapses two facts that
+    are not the same fact. ffprobe running to completion and exiting nonzero is
+    evidence about the *bytes*: they are not media. ffprobe failing to launch,
+    timing out, or a cancellation landing mid-check is evidence about the
+    *probe*: the artifact may be perfectly good video that Cove merely failed
+    to verify. Both fail the conversion closed and both keep the source; only
+    the first may be acted on destructively.
+
+    Falsy unless readable, so every `if not ...` caller - and the suites that
+    stub this seam with a plain `True` - keep working unchanged. The extra
+    distinction is read in exactly one place, where cleanup is decided.
+    """
+
+    __slots__ = ("readable", "rejected")
+
+    def __init__(self, readable: bool, rejected: bool):
+        self.readable = readable
+        self.rejected = rejected      # ffprobe finished and said no
+
+    def __bool__(self) -> bool:
+        return self.readable
+
+
+_READABLE = _Readability(readable=True, rejected=False)
+_REJECTED = _Readability(readable=False, rejected=True)
+_INCONCLUSIVE = _Readability(readable=False, rejected=False)
+
 
 def _final_output_is_readable(path: Path,
                               cancel_flag: threading.Event | None = None
-                              ) -> bool:
+                              ) -> _Readability:
     """Whether ffprobe can open the finished file as media.
 
     `_final_output_is_present` proves a file arrived; this proves something is
@@ -1585,10 +1633,13 @@ def _final_output_is_readable(path: Path,
 
     Fails closed on every way the check itself can fail: a missing or
     unlaunchable ffprobe, a timeout, or a cancellation landing either side of
-    the run. An unverified output is not a verified one.
+    the run. An unverified output is not a verified one - but it is also not a
+    rejected one, which is why those paths return `_INCONCLUSIVE` rather than
+    `_REJECTED`. Only a probe that actually ran to completion has said
+    anything about the file itself.
     """
     if cancel_flag is not None and cancel_flag.is_set():
-        return False
+        return _INCONCLUSIVE
     try:
         r = subprocess.run(
             [FFPROBE_BIN, "-v", "error", str(path)],
@@ -1597,10 +1648,57 @@ def _final_output_is_readable(path: Path,
             env=clean_subprocess_env(), **SUBPROCESS_FLAGS,
         )
     except (OSError, subprocess.SubprocessError):
-        return False
+        return _INCONCLUSIVE
     if cancel_flag is not None and cancel_flag.is_set():
-        return False
-    return r.returncode == 0
+        return _INCONCLUSIVE
+    if r.returncode == 0:
+        return _READABLE
+    # ffprobe has exactly one way of refusing a file, and any other status is
+    # the probe dying rather than answering - a POSIX signal death, or a
+    # Windows crash, which can be a large number (0xC0000005 arrives as
+    # 3221225477) or a small one (an aborted CRT process exits 3). A death says
+    # exactly as much about the bytes as a launch failure or a timeout does, so
+    # it is classed with them and the artifact is kept.
+    return (_REJECTED if r.returncode == _FFPROBE_REFUSAL_STATUS
+            else _INCONCLUSIVE)
+
+
+def _discard_rejected_output(output_path: Path) -> None:
+    """Remove a final artifact ffprobe ran on and refused.
+
+    The narrow counterpart to `_discard_reserved_output`. That one reclaims
+    only the zero-byte placeholder and leaves anything with bytes in it
+    strictly alone, precisely because it cannot prove whose bytes those are.
+    Here that proof exists, and only here: `reserve_output` claimed this exact
+    path with O_CREAT|O_EXCL so no pre-existing file was ever at it, the
+    encode filled that same claimed path from this job's own temp via
+    `os.replace`, and ownership has not passed to the user - readability
+    failed before the ok result, before any sidecar was finalized, and before
+    the source became eligible for deletion. The file is Cove's, it is not
+    media, and leaving it behind hands the user a broken video named like a
+    good one.
+
+    Deliberately one exact path and one ordinary unlink: no glob over
+    stem-alikes, no recursion, no overwrite pass, no retry loop. The
+    regular-file check is belt-and-braces - Tab 10 rejects a directory or a
+    non-regular path long before a probe runs - and exists so that a future
+    bug pointing this at a directory does nothing at all.
+
+    The conversion has already failed on readability, and that is the answer
+    the user needs; a cleanup that cannot run must not replace it. So an
+    OSError is swallowed exactly as `_discard_reserved_output` swallows its
+    own, and the artifact simply stays.
+    """
+    try:
+        st = os.stat(output_path)
+    except OSError:
+        return
+    if not stat_mod.S_ISREG(st.st_mode):
+        return
+    try:
+        os.unlink(output_path)
+    except OSError:
+        pass
 
 
 # ── MP4 → MKV container fallback ─────────────────────────────────────────────
@@ -2195,12 +2293,23 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
     # success whose bytes are not media is a different anomaly from the mux
     # failure the MP4 -> MKV retry exists for, so it carries no `mux_failed`
     # marker and earns no second encode.
-    if not _final_output_is_readable(output_path, cancel_flag):
+    verdict = _final_output_is_readable(output_path, cancel_flag)
+    if not verdict:
         if cancel_flag.is_set():
             # The flag landed between ffmpeg exiting and the gate running.
             # A cancelled job is not a successful conversion whatever the
-            # bytes would have probed as.
+            # bytes would have probed as - and an interrupted job's output is
+            # not Cove's to throw away, so it stays exactly where it is.
             return {"file": input_path, "status": "error", "msg": "cancelled"}
+        if verdict.rejected:
+            # ffprobe launched, finished, and refused these bytes. That is a
+            # verdict about the artifact rather than about the probe, so the
+            # file Cove reserved and filled - and is about to disown - goes
+            # with it. A probe that never got to answer (unlaunchable,
+            # timed out) reaches here too and deliberately does not: it may
+            # have been a good video, and deleting an output Cove merely
+            # failed to verify is the larger mistake of the two.
+            _discard_rejected_output(output_path)
         return {"file": input_path, "status": "error",
                 "msg": "The output file could not be verified as readable "
                        "media"}
