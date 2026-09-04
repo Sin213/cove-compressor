@@ -746,10 +746,17 @@ def test_k1_a_probe_that_exits_zero_is_accepted_whatever_else_it_printed(env):
     """Zero duration, an unrecognized format name, a codec Cove never emits:
     if ffprobe opened the file and reported a video stream, the file opened.
     Every semantic check beyond that pair is a separate policy with its own
-    false rejections, and none of them are in this slice."""
+    false rejections, and none of them are in this slice.
+
+    The reported stream is written in the vocabulary Tab 21 re-pointed the probe
+    at (`stream,0` rather than a bare index); the point of the test - that noise
+    printed beside a valid report does not retract it - is unchanged.
+    """
     src, out_dir, fake, spy = env
     fake.payloads = [GARBAGE]
-    spy.result = (0, "0\nduration=0.000000\nformat_name=utterly unexpected\n",
+    spy.result = (0,
+                  "stream,0\nduration=0.000000\n"
+                  "format_name=utterly unexpected\n",
                   "")
 
     result = _run(src, out_dir)
@@ -787,9 +794,12 @@ def test_k3_the_probe_asks_for_nothing_beyond_a_video_stream_index(env,
                    "-show_frames", "-count_frames", "-count_packets",
                    "-show_data", "-show_chapters", "-show_programs"):
         assert banned not in argv, f"{banned} is a semantic check"
-    # The one entry Tab 20 is allowed to ask for, and no other.
+    # The one entry the video gate is allowed to ask for, and no other. Tab 21
+    # re-pointed it from `stream=index` to the disposition that tells a picture
+    # from a thumbnail; it is still exactly one entry, bought in the same probe.
     assert argv.count("-show_entries") == 1
-    assert argv[argv.index("-show_entries") + 1] == "stream=index"
+    assert argv[argv.index("-show_entries") + 1] == \
+        "stream_disposition=attached_pic"
     assert argv[-1] == str(result["output"])
 
 

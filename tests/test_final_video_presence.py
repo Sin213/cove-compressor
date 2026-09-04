@@ -189,6 +189,29 @@ def two_video_media(tmp_path_factory) -> bytes:
 
 
 @pytest.fixture(scope="session")
+def audio_first_media(tmp_path_factory) -> bytes:
+    """An MKV whose only video stream is not stream 0.
+
+    Presence is presence wherever the picture sits, and a container that lists
+    its audio first is ordinary output, not a defect.
+    """
+    d = tmp_path_factory.mktemp("presence_audio_first_media")
+    path = d / "audio_first.mkv"
+    r = _ffmpeg(["-f", "lavfi", "-i", "sine=frequency=440:duration=0.5",
+                 "-f", "lavfi",
+                 "-i", "testsrc=size=160x120:rate=10:duration=0.5",
+                 "-map", "0:a", "-map", "1:v",
+                 "-c:v", "libx264", "-c:a", "aac", "-shortest", str(path)])
+    assert r.returncode == 0, f"could not build an audio-first sample: {r.stderr[-400:]}"
+    assert _video_stream_count(path) == 1
+    idx = _ffprobe(["-v", "error", "-select_streams", "v",
+                    "-show_entries", "stream=index", "-of", "csv=p=0",
+                    str(path)])
+    assert idx.stdout.strip() != "0", "the video must not be stream 0"
+    return path.read_bytes()
+
+
+@pytest.fixture(scope="session")
 def odd_codec_media(tmp_path_factory) -> bytes:
     """Video in a codec Cove never produces, in a container it does.
 
@@ -910,9 +933,11 @@ def test_m1_two_video_streams_satisfy_the_gate(env, two_video_media):
 
 
 def test_m2_a_scripted_multi_index_result_satisfies_the_gate(env, real_media):
+    """Two reported video streams, written in the vocabulary Tab 21 re-pointed
+    the probe at. `>= 1`, deliberately not `== 1`."""
     src, out_dir, fake, spy = env
     fake.payloads = [real_media[".mkv"]]
-    spy.result = (0, "0\n1\n", "")
+    spy.result = (0, "stream,0\nstream,0\n", "")
 
     result = _run(src, out_dir, fmt="MKV (H.265)")
 
@@ -942,15 +967,21 @@ def test_m4_a_single_frame_duration_satisfies_the_gate(env,
     assert result["status"] == "ok"
 
 
-def test_m5_a_nonzero_stream_index_still_counts(env, real_media):
-    """A video stream that is not stream 0 is still a video stream."""
+def test_m5_a_nonzero_stream_index_still_counts(env, audio_first_media):
+    """A video stream that is not stream 0 is still a video stream.
+
+    Real media rather than a scripted stream index: Tab 21 re-pointed the probe
+    at `stream_disposition=attached_pic`, so an index is no longer what the
+    payload carries - but where the picture sits in the file was always the
+    behaviour under test, and this proves it against a real container.
+    """
     src, out_dir, fake, spy = env
-    fake.payloads = [real_media[".mkv"]]
-    spy.result = (0, "3\n", "")
+    fake.payloads = [audio_first_media]
 
     result = _run(src, out_dir, fmt="MKV (H.265)")
 
     assert result["status"] == "ok"
+    assert Path(result["output"]).read_bytes() == audio_first_media
 
 
 # ══ GROUP N — result shape and isolation ═══════════════════════════════════

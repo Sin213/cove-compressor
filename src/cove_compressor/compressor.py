@@ -1581,23 +1581,54 @@ FINAL_READABILITY_TIMEOUT = 30
 # failing, and is treated like a launch failure or a timeout: preserve.
 _FFPROBE_REFUSAL_STATUS = 1
 
-# What turns the readability probe into a *video* readability probe, without
-# turning it into a second process.
+# What turns the readability probe into a *playable video* readability probe,
+# without turning it into a second process.
 #
-# `-select_streams v:0` narrows the report to the first video stream and
-# `stream=index` asks for the one field every stream has, so the answer is the
-# smallest thing ffprobe can be made to say: `csv=p=0` prints the bare index on
-# stdout when a video stream exists and prints nothing at all when none does.
-# Measured against the real binary on audio-only MP4/MKV/WebM built by ffmpeg
-# itself, every one exits 0 with empty stdout; the same containers carrying
-# picture exit 0 and print an index.
+# A stream index proves a video stream exists, and that is not the question. A
+# container may carry picture that was never meant to be played: cover art, a
+# poster frame, a thumbnail, flagged `attached_pic` precisely so players show it
+# instead of decoding it. An audio track with artwork glued to it prints an
+# index exactly as a film does, and asking for the index cannot tell them apart.
+# `attached_pic` can, ffprobe already knows it, and asking for it costs the same
+# single invocation - so the probe asks for it instead.
 #
-# Deliberately `v:0` and not `v`: one line is all the evidence "at least one"
-# needs, and asking for the whole list would invite counting it. Tab 20 is a
-# presence rule, not a parity rule.
-_FFPROBE_VIDEO_STREAM_ARGS = ("-select_streams", "v:0",
-                              "-show_entries", "stream=index",
-                              "-of", "csv=p=0")
+# `-select_streams v` narrows the report to video streams,
+# `stream_disposition=attached_pic` asks each of them the one question that
+# separates a picture from a thumbnail, and `csv=p=1` prints one `stream,<0|1>`
+# line per video stream. The `stream` prefix is what `p=1` buys and it is load-
+# bearing: it proves a stream was reported at all, so empty stdout unambiguously
+# means "no video streams" rather than "a stream that printed nothing", and a
+# stream whose disposition ever went missing would print a bare `stream,` that
+# is visibly not the contract. Measured against the real binary on ffmpeg-built
+# media: ordinary MP4/MKV/WebM video prints `stream,0`, an MP4 carrying
+# `-disposition attached_pic` artwork and an MKV carrying an `-attach`ed cover
+# both print `stream,1`, a file holding both prints one of each, and audio-only
+# containers print nothing at all.
+#
+# Deliberately `v` and not `v:0`: artwork routinely sorts ahead of the real
+# picture, so the playable stream is not guaranteed to be the first one and
+# every video stream has to be asked. It is still a presence rule and not a
+# parity rule - the lines are weighed for containing a `0`, never counted.
+_FFPROBE_VIDEO_STREAM_ARGS = ("-select_streams", "v",
+                              "-show_entries",
+                              "stream_disposition=attached_pic",
+                              "-of", "csv=p=1")
+
+# The two whole lines the probe above is defined to print. `attached_pic` takes
+# 0 - picture the file exists to show in motion - or 1 - picture attached to
+# something else; `csv=p=1` puts the section name in front of it, and both
+# halves are checked.
+#
+# The section name is not decoration. Matching only the value after the last
+# comma would let any line that happens to end in `,0` vouch for a playable
+# stream that was never reported, and - the dangerous direction - let any line
+# ending in `,1` be counted as artwork, completing an "every picture here is a
+# thumbnail" verdict that *removes the file*. A payload this code cannot parse
+# must never do either: it is the validator failing, not the artifact, and it
+# is classed inconclusive below. Anything that is not exactly one of these two
+# strings is that.
+_PLAYABLE_VIDEO_RECORD = "stream,0"
+_ATTACHED_PICTURE_RECORD = "stream,1"
 
 
 class _Readability:
@@ -1606,8 +1637,9 @@ class _Readability:
     Four outcomes, not two, because "not readable" collapses facts that are not
     the same fact. ffprobe running to completion and exiting nonzero is evidence
     about the *bytes*: they are not media. ffprobe parsing the file and finding
-    no video stream in it is evidence about the *content*: they are media, and
-    they are not a video. ffprobe failing to launch, timing out, or a
+    no video stream in it - or none that is anything but attached artwork - is
+    evidence about the *content*: they are media, and they are not a video that
+    can be watched. ffprobe failing to launch, timing out, or a
     cancellation landing mid-check is evidence about the *probe*: the artifact
     may be perfectly good video that Cove merely failed to verify. All three
     fail the conversion closed and all three keep the source; only the first two
@@ -1632,12 +1664,55 @@ class _Readability:
 
 _READABLE = _Readability(readable=True, rejected=False)
 _REJECTED = _Readability(readable=False, rejected=True)
-# Media, and not a video. A verdict about the artifact exactly as `_REJECTED`
-# is, so it carries the same destructive licence - it is only told apart to say
-# something true to the user, because "could not be verified as readable media"
-# would send them debugging bytes that are perfectly fine.
+# Media, and not a watchable video: no video stream at all, or none carrying
+# anything but attached artwork. A verdict about the artifact exactly as
+# `_REJECTED` is, so it carries the same destructive licence - it is only told
+# apart to say something true to the user, because "could not be verified as
+# readable media" would send them debugging bytes that are perfectly fine.
 _NO_VIDEO = _Readability(readable=False, rejected=True, no_video=True)
 _INCONCLUSIVE = _Readability(readable=False, rejected=False)
+
+
+def _playable_video_verdict(stdout: str) -> _Readability:
+    """Read one probe's video-stream report as a verdict about playable picture.
+
+    Three answers, and the difference between the last two decides whether a
+    file is deleted. A printed `0` is positive proof that a stream exists which
+    is not a thumbnail, and that is the whole success condition: one is enough,
+    five are equally fine, and where in the list it sits does not matter. Proof
+    once found is not retracted by anything printed after it, so noise beside a
+    `0` still passes - only the *absence* of proof has to be classified.
+
+    Absent, it can be absent two ways. Every line being `1`, or there being no
+    lines at all, is ffprobe answering completely: this file's only pictures are
+    attachments, or it has no picture at all. That is a verdict about the
+    artifact and carries the licence to remove it. A line that is neither value
+    is ffprobe not answering in the vocabulary asked for - a changed output
+    format, a missing disposition, a truncated write - and that is the validator
+    failing rather than the file, indistinguishable in consequence from a
+    timeout. It fails the conversion closed like every other unverified result,
+    and it keeps the bytes, because deleting media no probe ever judged is the
+    larger of the two mistakes.
+
+    Each non-blank line is matched whole against the two forms the contract can
+    take. Nothing is extracted from a line that is not one of them, because a
+    line the parser cannot read has to stay outside both counts - a stray `,0`
+    must not vouch for picture that was never reported, and a stray `,1` must
+    not help complete the verdict that deletes the file.
+    """
+    playable = False
+    unrecognized = False
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line == _PLAYABLE_VIDEO_RECORD:
+            playable = True
+        elif line != _ATTACHED_PICTURE_RECORD:
+            unrecognized = True
+    if playable:
+        return _READABLE
+    return _INCONCLUSIVE if unrecognized else _NO_VIDEO
 
 
 def _final_output_is_readable(path: Path,
@@ -1660,13 +1735,22 @@ def _final_output_is_readable(path: Path,
     including the offer to delete the only copy of the picture. So the same
     invocation is asked for one more fact, `_FFPROBE_VIDEO_STREAM_ARGS`, and
     both are read off it: the exit code says whether this is media, and stdout
-    says whether any of it is video.
+    says whether any of it is video the user can watch.
+
+    Watchable, not merely present, because containers carry picture that was
+    never meant to be played. An audio file with cover art holds a real
+    codec_type=video stream - flagged `attached_pic`, sized like a thumbnail,
+    and shown rather than decoded - so "has a video stream" accepts it and
+    hands the user an album track named like a film. `attached_pic` is the one
+    field that tells the two apart, and `_playable_video_verdict` weighs the
+    report for at least one stream that is not artwork.
 
     That pair is the whole policy. Duration, video/audio/subtitle counts,
-    codecs, resolution and container names are all separate policies, each with
-    its own false rejections - a legitimately odd but playable file must not be
-    thrown away here - so the printed index is weighed only for existing. One
-    stream is enough and five are equally fine.
+    codecs, resolution, container names and every other disposition flag are
+    separate policies, each with its own false rejections - a legitimately odd
+    but playable file must not be thrown away here - so the report is weighed
+    only for a non-attached picture existing. One is enough and five are
+    equally fine, and artwork alongside real picture is an ordinary good file.
 
     Fails closed on every way the check itself can fail: a missing or
     unlaunchable ffprobe, a timeout, or a cancellation landing either side of
@@ -1701,10 +1785,9 @@ def _final_output_is_readable(path: Path,
         # media at all.
         return (_REJECTED if r.returncode == _FFPROBE_REFUSAL_STATUS
                 else _INCONCLUSIVE)
-    # Media. Now: is any of it picture? A printed stream index is the evidence,
-    # and the only evidence - stripped first, because "no video stream" arrives
-    # as empty output that a trailing newline would otherwise make look full.
-    return _READABLE if (r.stdout or "").strip() else _NO_VIDEO
+    # Media. Now: is any of it picture the user can watch? The per-stream
+    # dispositions are the evidence, and the only evidence.
+    return _playable_video_verdict(r.stdout)
 
 
 def _discard_rejected_output(output_path: Path) -> None:
@@ -2356,7 +2439,12 @@ def _encode_video(*, input_path: Path, output_path: Path, tmp_path: Path,
             # mistake of the two.
             _discard_rejected_output(output_path)
         return {"file": input_path, "status": "error",
-                "msg": ("The output file contains no video stream"
+                # "no video stream" was true while the only rejected case was a
+                # file with none. An artwork-only output has one, and telling
+                # the user it does not would send them debugging a stream they
+                # can see; "playable" is true of both cases and of neither
+                # good one.
+                "msg": ("The output file contains no playable video stream"
                         if verdict.no_video else
                         "The output file could not be verified as readable "
                         "media")}
