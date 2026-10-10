@@ -187,15 +187,19 @@ else:
 
 
 def _resolve_binary(name: str) -> str:
-    """Locate ffmpeg/ffprobe. Prefer a binary shipped next to the app
-    (bundled release), then next to the package (dev), then PATH."""
+    """Locate ffmpeg/ffprobe in the bundle, next to the app, or on PATH."""
     exe = f"{name}.exe" if sys.platform == "win32" else name
     candidates: list[Path] = []
-    if getattr(sys, "frozen", False):
+    frozen = getattr(sys, "frozen", False)
+    if frozen:
+        bundle_root = getattr(sys, "_MEIPASS", None)
+        if bundle_root and os.path.isabs(bundle_root):
+            candidates.append(Path(bundle_root) / exe)
         candidates.append(Path(sys.executable).parent / exe)
-    candidates.append(Path(__file__).resolve().parent.parent.parent / exe)
+    else:
+        candidates.append(Path(__file__).resolve().parent.parent.parent / exe)
     for c in candidates:
-        if c.is_file():
+        if c.is_file() and (not frozen or sys.platform == "win32" or os.access(c, os.X_OK)):
             return str(c)
     return shutil.which(name) or name
 
