@@ -130,6 +130,7 @@ class ResolveBinaryTests(unittest.TestCase):
                     self.assertEqual(compressor._resolve_binary(name), str(adjacent))
                     which.assert_not_called()
 
+    @unittest.skipIf(os.name == "nt", reason="POSIX executable permissions")
     def test_posix_nonexecutable_bundle_uses_adjacent(self):
         self.frozen()
         for name in ("ffmpeg", "ffprobe"):
@@ -140,6 +141,7 @@ class ResolveBinaryTests(unittest.TestCase):
                     self.assertEqual(compressor._resolve_binary(name), str(adjacent))
                     which.assert_not_called()
 
+    @unittest.skipIf(os.name == "nt", reason="POSIX executable permissions")
     def test_posix_nonexecutable_adjacent_uses_path(self):
         self.frozen()
         for name in ("ffmpeg", "ffprobe"):

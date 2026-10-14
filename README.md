@@ -122,23 +122,27 @@ install needed on either platform.
 
 Python 3.10+.
 
+The package lives under `src/`, so run from the repository root with
+`PYTHONPATH=src`; no package install step is needed.
+
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m cove_compressor
+PYTHONPATH=src .venv/bin/python -m cove_compressor
 ```
 
-Make sure `ffmpeg` and `ffprobe` are on PATH (e.g. `sudo pacman -S ffmpeg` on
-Arch, `sudo apt install ffmpeg` on Debian/Ubuntu), or drop `ffmpeg`/`ffprobe`
-binaries next to the project root.
+In source mode, video operations may need host `ffmpeg` and `ffprobe` on PATH
+(e.g. `sudo pacman -S ffmpeg` on Arch, `sudo apt install ffmpeg` on
+Debian/Ubuntu), or binaries next to the project root. Packaged artifacts
+bundle both tools.
 
-### PYTHONPATH shortcut
+### Running the tests
 
-The package lives under `src/`; the entry point is `cove_compressor.__main__`.
-If you prefer running from a checkout without installing:
+From the repository root, using the same virtual environment:
 
 ```bash
-PYTHONPATH=src python -m cove_compressor
+.venv/bin/pip install pytest
+PYTHONPATH=src QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q tests
 ```
 
 ---
