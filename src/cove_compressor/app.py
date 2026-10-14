@@ -258,6 +258,25 @@ class FileQueue(QFrame):
             chips_row.addWidget(chip)
         chips_row.addStretch()
         ev.addLayout(chips_row)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        actions.addStretch()
+        self._empty_files_btn = QPushButton("Add files…")
+        self._empty_folder_btn = QPushButton("Add folder…")
+        for button, name, browse in (
+            (self._empty_files_btn, "Add files", self._browse_files),
+            (self._empty_folder_btn, "Add folder", self._browse_folder),
+        ):
+            button.setObjectName("GhostButton")
+            button.setProperty("emptyQueueAction", True)
+            button.setAccessibleName(f"{name} ({kind_label})")
+            button.clicked.connect(browse)
+            button.installEventFilter(self)
+            actions.addWidget(button)
+        actions.addStretch()
+        ev.addLayout(actions)
+        QWidget.setTabOrder(self._empty_files_btn, self._empty_folder_btn)
         ev.addStretch()
 
         self._stack.addWidget(empty)
@@ -281,11 +300,13 @@ class FileQueue(QFrame):
 
         self._add_more_btn = QPushButton("Add more…")
         self._add_more_btn.setObjectName("GhostButton")
+        self._add_more_btn.setProperty("emptyQueueAction", True)
         self._add_more_btn.clicked.connect(self._browse_files)
         bh.addWidget(self._add_more_btn)
 
         self._add_folder_btn = QPushButton("Add folder…")
         self._add_folder_btn.setObjectName("GhostButton")
+        self._add_folder_btn.setProperty("emptyQueueAction", True)
         self._add_folder_btn.clicked.connect(self._browse_folder)
         bh.addWidget(self._add_folder_btn)
 
@@ -364,6 +385,32 @@ class FileQueue(QFrame):
                 f"  background: #0c1417;"
                 f"}}"
             )
+        self.setStyleSheet(self.styleSheet() +
+            f'QPushButton[emptyQueueAction="true"]:focus {{'
+            f'border-color: {theme.ACCENT}; border-style: solid; }}')
+
+    def eventFilter(self, watched, event):
+        if (watched in (self._empty_files_btn, self._empty_folder_btn)
+                and event.type() == QEvent.KeyPress
+                and event.key() in (Qt.Key_Return, Qt.Key_Enter)):
+            watched.click()
+            return True
+        return super().eventFilter(watched, event)
+
+    def _browse_button(self, folder: bool = False) -> QPushButton:
+        if self._stack.currentIndex() == 0:
+            return self._empty_folder_btn if folder else self._empty_files_btn
+        return self._add_folder_btn if folder else self._add_more_btn
+
+    def browse_visible(self, folder: bool = False) -> None:
+        button = self._browse_button(folder)
+        if button.isVisible() and button.isEnabled():
+            button.click()
+
+    def _focus_add_files(self) -> None:
+        button = self._browse_button()
+        if button.isVisible() and button.isEnabled():
+            button.setFocus(Qt.TabFocusReason)
 
     # ── public API ─────────────────────────────────────────────────────
 
@@ -496,6 +543,10 @@ class FileQueue(QFrame):
     # ── internal ──────────────────────────────────────────────────────
 
     def _rebuild_list(self):
+        focused = QApplication.focusWidget()
+        list_focus = focused is self._list or self._list.isAncestorOf(focused)
+        page_changed = self._stack.currentIndex() != (0 if not self._entries else 1)
+        restore_focus = list_focus or (page_changed and self.isAncestorOf(focused))
         self._thumb_labels.clear()
         self._status_labels.clear()
         self._dir_remaining.clear()
@@ -504,6 +555,11 @@ class FileQueue(QFrame):
         for entry in self._entries:
             self._append_item(entry)
         self._stack.setCurrentIndex(0 if not self._entries else 1)
+        if restore_focus:
+            if list_focus and self._entries:
+                self._list.setFocus(Qt.TabFocusReason)
+            else:
+                self._focus_add_files()
         if self._entries:
             total = sum(0 if e.is_dir else (e.path.stat().st_size if e.path.exists() else 0)
                         for e in self._entries)
@@ -922,6 +978,13 @@ class MainWindow(QMainWindow):
         self.queue_stack.addWidget(self.img_queue)
         self.queue_stack.addWidget(self.vid_queue)
         main_col.addWidget(self.queue_stack, stretch=1)
+
+        for key, folder in (("Ctrl+O", False), ("Ctrl+Shift+O", True)):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.WindowShortcut)
+            shortcut.activated.connect(
+                lambda folder=folder: self.queue_stack.currentWidget().browse_visible(folder)
+            )
 
         # Action bar (status + progress + show-log + start/cancel)
         action = QFrame()
@@ -1474,9 +1537,13 @@ class MainWindow(QMainWindow):
 
     def _set_tab(self, kind: str) -> None:
         is_images = kind == "images"
+        previous = self.queue_stack.currentWidget()
+        queue_focus = previous.isAncestorOf(QApplication.focusWidget())
         self.images_tab.setChecked(is_images)
         self.videos_tab.setChecked(not is_images)
         self.queue_stack.setCurrentIndex(0 if is_images else 1)
+        if queue_focus and previous is not self.queue_stack.currentWidget():
+            self.queue_stack.currentWidget()._focus_add_files()
         self.options_stack.setCurrentIndex(0 if is_images else 1)
         self.start_btn.setText(
             "Start image compression" if is_images else "Start video compression"
