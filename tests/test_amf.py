@@ -86,7 +86,12 @@ class EncoderArgsAmfTest(unittest.TestCase):
         # AMF must never take the log-file two-pass path.
         self.assertNotIn("-pass", args)
 
-    def test_amf_bitrate_mode_uses_vbr_with_capped_maxrate(self):
+    def test_amf_bitrate_mode_uses_vbr_peak_with_capped_maxrate(self):
+        # ffmpeg's AMF encoders have no bare `vbr` mode - handing them one
+        # fails at option parsing ("Unable to parse \"rc\" option value
+        # \"vbr\"") before any frame is encoded. `vbr_peak` is AMF's
+        # peak-constrained VBR, which is what this -b:v/-maxrate/-bufsize
+        # envelope has always meant to express.
         args = build_video_encoder_args(
             encoder="h264_amf", vf=None, use_two_pass=False, pass_num=None,
             video_kbps=2000, crf=None, speed_preset="medium",
@@ -95,7 +100,8 @@ class EncoderArgsAmfTest(unittest.TestCase):
         self.assertEqual(_val(args, "-b:v"), "2000k")
         self.assertEqual(_val(args, "-maxrate"), "2800k")   # 2000 * 1.4
         self.assertEqual(_val(args, "-bufsize"), "4000k")   # 2000 * 2
-        self.assertEqual(_val(args, "-rc"), "vbr")
+        self.assertEqual(_val(args, "-rc"), "vbr_peak")
+        self.assertNotIn("vbr", args)
         # AMF has no equivalent of NVENC's -multipass fullres.
         self.assertNotIn("-multipass", args)
         self.assertNotIn("-pass", args)

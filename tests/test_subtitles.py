@@ -21,7 +21,7 @@ from cove_compressor.compressor import (  # noqa: E402
     build_subtitle_extract_cmd,
     compress_video,
     delete_source_if_eligible,
-    ffprobe_subtitle_streams,
+    ffprobe_stream_inventory,
     is_english_subtitle_stream,
     subtitle_sidecar_name,
     subtitle_sidecar_target,
@@ -52,8 +52,16 @@ def _has_pair(cmd, a, b) -> bool:
 
 class FakeFfmpeg:
     """Stands in for `run_ffmpeg`. Subtitle extraction invocations are the ones
-    carrying `-map`; everything else is a video encode. Both write their output
-    file, exactly like the real thing, so callers see a success *shape*."""
+    that strip both other stream kinds — `-vn` *and* `-an` together, which is
+    the shape only `build_subtitle_extract_cmd` produces. Everything else is a
+    video encode. (`-map` alone is not a discriminator: normal MP4 encodes now
+    carry explicit stream maps too, and two-pass pass 1 carries `-an`.) Both
+    write their output file, exactly like the real thing, so callers see a
+    success *shape*."""
+
+    @staticmethod
+    def _is_subtitle_extraction(cmd) -> bool:
+        return "-vn" in cmd and "-an" in cmd and "-map" in cmd
 
     def __init__(self, encode_bytes=b"v" * 10, sub_bytes=b"1\nhello\n",
                  sub_rc=0, encode_rc=0, sub_rc_by_index=None,
@@ -70,7 +78,7 @@ class FakeFfmpeg:
     def __call__(self, cmd, cancel_flag, duration=None,
                  on_progress=None, on_start=None):
         out = Path(cmd[-1])
-        if "-map" in cmd:
+        if self._is_subtitle_extraction(cmd):
             self.subtitle_cmds.append(list(cmd))
             idx = cmd[cmd.index("-map") + 1].split(":")[-1]
             rc = self.sub_rc_by_index.get(int(idx), self.sub_rc)
@@ -93,18 +101,24 @@ def video_env(tmp_path, monkeypatch):
 
     fake = FakeFfmpeg()
     monkeypatch.setattr(compressor, "run_ffmpeg", fake)
+    # The encoder is faked, so nothing it "writes" is real media. The final
+    # readability gate is a separate contract with its own suite.
+    monkeypatch.setattr(compressor, "_final_output_is_readable",
+                        lambda path, cancel_flag=None: True)
     monkeypatch.setattr(compressor, "ffprobe_duration", lambda p: 10.0)
     monkeypatch.setattr(compressor, "nvenc_available", lambda e="hevc_nvenc": False)
     monkeypatch.setattr(compressor, "amf_available", lambda e="hevc_amf": False)
     return src, out_dir, fake
 
 
-def _probe(monkeypatch, streams, calls=None):
+def _probe(monkeypatch, streams, calls=None, audio_count=1):
+    """Fake the one stream inventory probe; subtitles are what this suite reads."""
     def fake(path):
         if calls is not None:
             calls.append(Path(path))
-        return list(streams)
-    monkeypatch.setattr(compressor, "ffprobe_subtitle_streams", fake)
+        return compressor.StreamInventory(
+            subtitles=list(streams), audio_count=audio_count)
+    monkeypatch.setattr(compressor, "ffprobe_stream_inventory", fake)
     return fake
 
 
@@ -114,9 +128,14 @@ def _run(src, out_dir, **kw):
         None, "192", threading.Event(), **kw)
 
 
-# ── Group 1 - setting OFF performs zero probes ──────────────────────────────
+# ── Group 1 - setting OFF performs zero extraction ──────────────────────────
+#
+# These run as MKV, which maps its streams explicitly and so classifies
+# subtitles once for that purpose alone (see `tests/test_mkv_attachments.py`).
+# What must stay at zero with the setting off is the *extraction* work: no
+# sidecar invocation, no sidecar keys, no `subtitles_failed`.
 
-def test_default_argument_never_probes(video_env, monkeypatch):
+def test_default_argument_never_extracts(video_env, monkeypatch):
     src, out_dir, fake = video_env
     calls: list[Path] = []
     _probe(monkeypatch, [_stream(2, language="eng")], calls)
@@ -124,13 +143,13 @@ def test_default_argument_never_probes(video_env, monkeypatch):
     result = _run(src, out_dir)
 
     assert result["status"] == "ok"
-    assert calls == []
+    assert len(calls) == 1          # the mapping probe, never a second one
     assert fake.subtitle_cmds == []
     assert "subtitles_extracted" not in result
     assert not result.get("subtitles_failed")
 
 
-def test_explicit_false_never_probes(video_env, monkeypatch):
+def test_explicit_false_never_extracts(video_env, monkeypatch):
     src, out_dir, fake = video_env
     calls: list[Path] = []
     _probe(monkeypatch, [_stream(2, language="eng")], calls)
@@ -138,7 +157,7 @@ def test_explicit_false_never_probes(video_env, monkeypatch):
     result = _run(src, out_dir, extract_english_subtitles=False)
 
     assert result["status"] == "ok"
-    assert calls == []
+    assert len(calls) == 1
     assert fake.subtitle_cmds == []
 
 
@@ -400,7 +419,7 @@ def test_probe_failure_blocks_deletion(video_env, monkeypatch):
     def boom(path):
         raise SubtitleProbeError("ffprobe crashed")
 
-    monkeypatch.setattr(compressor, "ffprobe_subtitle_streams", boom)
+    monkeypatch.setattr(compressor, "ffprobe_stream_inventory", boom)
 
     result = _run(src, out_dir, extract_english_subtitles=True)
 
@@ -422,7 +441,7 @@ def test_probe_raises_on_bad_json(monkeypatch, tmp_path):
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
     with pytest.raises(SubtitleProbeError):
-        ffprobe_subtitle_streams(tmp_path / "x.mkv")
+        ffprobe_stream_inventory(tmp_path / "x.mkv")
 
 
 def test_probe_raises_on_nonzero_exit(monkeypatch, tmp_path):
@@ -431,7 +450,7 @@ def test_probe_raises_on_nonzero_exit(monkeypatch, tmp_path):
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
     with pytest.raises(SubtitleProbeError):
-        ffprobe_subtitle_streams(tmp_path / "x.mkv")
+        ffprobe_stream_inventory(tmp_path / "x.mkv")
 
 
 def test_probe_raises_when_ffprobe_missing(monkeypatch, tmp_path):
@@ -440,12 +459,12 @@ def test_probe_raises_when_ffprobe_missing(monkeypatch, tmp_path):
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
     with pytest.raises(SubtitleProbeError):
-        ffprobe_subtitle_streams(tmp_path / "x.mkv")
+        ffprobe_stream_inventory(tmp_path / "x.mkv")
 
 
 def test_probe_returns_absolute_indexes(monkeypatch, tmp_path):
     payload = {"streams": [
-        {"index": 5, "codec_name": "subrip",
+        {"index": 5, "codec_name": "subrip", "codec_type": "subtitle",
          "tags": {"language": "eng"},
          "disposition": {"forced": 0, "hearing_impaired": 0}},
     ]}
@@ -458,10 +477,13 @@ def test_probe_returns_absolute_indexes(monkeypatch, tmp_path):
             cmd, 0, stdout=json.dumps(payload), stderr="")
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
-    streams = ffprobe_subtitle_streams(tmp_path / "x.mkv")
+    inventory = ffprobe_stream_inventory(tmp_path / "x.mkv")
 
-    assert [s["index"] for s in streams] == [5]
-    assert _has_pair(seen["cmd"], "-select_streams", "s")
+    assert [s["index"] for s in inventory.subtitles] == [5]
+    # The probe inventories every stream now - audio has to be counted from
+    # the same answer - so the classification happens here, not in ffprobe's
+    # stream selector.
+    assert "-select_streams" not in seen["cmd"]
     assert _has_pair(seen["cmd"], "-of", "json")
 
 
@@ -470,11 +492,11 @@ def test_probe_empty_stream_list_is_not_an_error(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
-    assert ffprobe_subtitle_streams(tmp_path / "x.mkv") == []
+    assert ffprobe_stream_inventory(tmp_path / "x.mkv") == ([], 0)
 
 
 def test_probe_rejects_stream_without_index(monkeypatch, tmp_path):
-    payload = {"streams": [{"codec_name": "subrip"}]}
+    payload = {"streams": [{"codec_name": "subrip", "codec_type": "subtitle"}]}
 
     def fake_run(cmd, **kw):
         return subprocess.CompletedProcess(
@@ -482,7 +504,7 @@ def test_probe_rejects_stream_without_index(monkeypatch, tmp_path):
 
     monkeypatch.setattr(compressor.subprocess, "run", fake_run)
     with pytest.raises(SubtitleProbeError):
-        ffprobe_subtitle_streams(tmp_path / "x.mkv")
+        ffprobe_stream_inventory(tmp_path / "x.mkv")
 
 
 # ── Group 9 - extraction failure fails closed ───────────────────────────────
@@ -657,7 +679,7 @@ def test_subtitles_off_with_delete_on_is_unchanged(video_env, monkeypatch):
     result = _run(src, out_dir)
     delete_source_if_eligible(result, enabled=True)
 
-    assert calls == []
+    assert len(calls) == 1          # mapping only; extraction stayed off
     assert fake.subtitle_cmds == []
     assert result["source_deleted"] is True
     assert not src.exists()
