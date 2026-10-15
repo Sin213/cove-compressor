@@ -19,7 +19,7 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1] / "src")
 class ResolveBinaryTests(unittest.TestCase):
     def setUp(self):
         temporary = self.enterContext(tempfile.TemporaryDirectory())
-        self.root = Path(temporary)
+        self.root = Path(temporary).resolve()
         self.checkout = self.root / "checkout"
         self.bundle = self.root / "bundle"
         self.adjacent = self.root / "app"

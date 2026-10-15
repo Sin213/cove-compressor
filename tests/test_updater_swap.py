@@ -13,7 +13,7 @@ from cove_compressor.updater import swap_in_appimage  # noqa: E402
 class SwapInAppImageTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.dir = Path(self._tmp.name)
+        self.dir = Path(self._tmp.name).resolve()
         self.cache = self.dir / "cache"
         self.cache.mkdir()
         self.old = self.dir / "cove-pdf-editor-1.2.0-x86_64.AppImage"
