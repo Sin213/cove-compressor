@@ -13,12 +13,12 @@
 
 .EXAMPLE
     .\build.ps1
-    .\build.ps1 -Version 2.0.0
+    .\build.ps1 -Version 2.6.0
 #>
 
 [CmdletBinding()]
 param(
-    [string]$Version = "2.0.0"
+    [string]$Version = "2.6.0"
 )
 
 $ErrorActionPreference = 'Stop'

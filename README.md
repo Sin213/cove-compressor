@@ -11,9 +11,9 @@ GitHub Actions.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v2.5.0-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v2.6.0-5eead4?style=flat-square)
 
-![Cove Compressor v2.5.0](docs/screenshot.png)
+![Cove Compressor v2.6.0](docs/screenshot.png)
 
 ---
 
@@ -138,10 +138,13 @@ bundle both tools.
 
 ### Running the tests
 
-From the repository root, using the same virtual environment:
+The suite drives a real `ffmpeg` and `ffprobe` (with the H.264, H.265 and VP9
+encoders), so both must be on `PATH`; CI installs them on its Ubuntu and
+Windows runners before the tests run. From the repository root, using the same
+virtual environment:
 
 ```bash
-.venv/bin/pip install pytest
+.venv/bin/pip install pytest pyyaml
 PYTHONPATH=src QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q tests
 ```
 
@@ -214,9 +217,21 @@ Linux artifacts.
 
 ### Automated release via GitHub Actions
 
-Push a tag matching `v*` (e.g. `v2.4.0`) and `.github/workflows/release.yml`
-runs the Linux + Windows jobs in parallel and attaches all four artifacts to
-a draft GitHub Release created for the tag.
+Push a tag matching `v*` (e.g. `v2.6.0`) and `.github/workflows/release.yml`
+runs, in order:
+
+1. `resolve-version` - the tag must equal `__version__` in the source.
+2. `verify-tests` - the full suite on Ubuntu and Windows (`tests.yml`).
+3. `build-linux` and `build-windows` in parallel. Each verifies that `ffmpeg`
+   and `ffprobe` are inside what it built, writes the `.sha256` files, checks
+   them, and uploads the binaries and checksums together as one workflow
+   artifact.
+4. `release` - runs only for a tag and only if all of the above passed. It
+   re-verifies all eight files and checksums
+   (`scripts/release_verify.py`) and creates the GitHub Release as a **draft**
+   with exactly those eight assets (`scripts/draft_release.py`). The notes come
+   from `.github/release-notes/v<version>.md`, which must exist. The workflow
+   never publishes; review the draft and publish it by hand.
 
 ---
 
@@ -239,7 +254,12 @@ packaging/
   cove-compressor.desktop
 scripts/
   build-release.sh     # Linux AppImage + .deb builder
+  release_verify.py    # checks assets, checksums and bundled ffmpeg/ffprobe
+  draft_release.py     # creates/reads back the draft GitHub Release
 build.ps1              # Windows Setup.exe + Portable.exe builder
+.github/
+  workflows/           # tests.yml (CI) + release.yml (build + draft release)
+  release-notes/       # v<version>.md, the body of each GitHub Release
 ```
 
 ---
@@ -272,6 +292,8 @@ build.ps1              # Windows Setup.exe + Portable.exe builder
 | Drag the window                     | Left-drag on the titlebar             |
 | Maximize / restore                  | Double-click the titlebar             |
 | Resize the window                   | Left-drag on any edge                 |
+| Add files to the current queue      | `Ctrl+O`                              |
+| Add a folder to the current queue   | `Ctrl+Shift+O`                        |
 
 ---
 

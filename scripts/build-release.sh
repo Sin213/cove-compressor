@@ -7,7 +7,7 @@
 # Downloads a static ffmpeg+ffprobe build automatically.
 #
 # Env flags:
-#   VERSION=X.Y.Z        set output version (default 2.0.0)
+#   VERSION=X.Y.Z        set output version (default 2.6.0)
 #   APPIMAGE_ONLY=1      skip the .deb build (faster iteration)
 #
 # Output lands in release/.
@@ -18,7 +18,7 @@ cd "$ROOT"
 
 APP_NAME="cove-compressor"
 DISPLAY_NAME="Cove Compressor"
-VERSION="${VERSION:-2.0.0}"
+VERSION="${VERSION:-2.6.0}"
 ARCH="x86_64"
 DEB_ARCH="amd64"
 RELEASE_DIR="$ROOT/release"

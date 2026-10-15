@@ -12,7 +12,12 @@ on:
         default: '0.0.0-dev'
 
 permissions:
-  contents: write
+  contents: read
+
+# Two runs for the same ref must not both touch one draft release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   resolve-version:
@@ -20,13 +25,24 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
+
       - id: ver
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
+          set -euo pipefail
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             v="${GITHUB_REF_NAME#v}"
           else
-            v="${{ github.event.inputs.version }}"
-            [ -z "$v" ] && v="0.0.0-dev"
+            v="${INPUT_VERSION:-0.0.0-dev}"
+          fi
+          # The number in the tag, the number in the source and the number in
+          # every artifact name must be one number.
+          src="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/cove_compressor/__init__.py)"
+          if [ "$v" != "0.0.0-dev" ] && [ "$v" != "$src" ]; then
+            echo "::error::version $v does not match __version__ $src in src/cove_compressor/__init__.py"
+            exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
@@ -59,38 +75,41 @@ jobs:
           chmod +x scripts/build-release.sh
           bash scripts/build-release.sh
 
-      - name: Upload AppImage
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-appimage
-          path: release/*.AppImage
-          if-no-files-found: error
-
-      - name: Upload .deb
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-deb
-          path: release/*.deb
-          if-no-files-found: error
+      - name: Verify the AppImage and .deb carry ffmpeg and ffprobe
+        run: |
+          set -euo pipefail
+          ls -l release
+          deb="release/cove-compressor_${VERSION}_amd64.deb"
+          appimage="release/Cove-Compressor-${VERSION}-x86_64.AppImage"
+          python3 scripts/release_verify.py deb "$deb" "$VERSION"
+          [ "$(dpkg-deb -f "$deb" Version)" = "$VERSION" ]
+          mkdir "$RUNNER_TEMP/appimage"
+          (cd "$RUNNER_TEMP/appimage" && "$GITHUB_WORKSPACE/$appimage" --appimage-extract > /dev/null)
+          python3 scripts/release_verify.py tree "$RUNNER_TEMP/appimage/squashfs-root" --run
 
       - name: Generate checksums
         run: |
+          set -euo pipefail
           cd release
-          for f in *.AppImage *.deb; do
-            [ -e "$f" ] && sha256sum "$f" > "$f.sha256"
+          for f in "Cove-Compressor-${VERSION}-x86_64.AppImage" "cove-compressor_${VERSION}_amd64.deb"; do
+            sha256sum "$f" > "$f.sha256"
           done
 
-      - name: Attach to GitHub Release
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
+      - name: Verify binaries and checksums
+        run: |
+          set -euo pipefail
+          (cd release && sha256sum -c ./*.sha256)
+          python3 scripts/release_verify.py assets release "$VERSION" --platform linux
+
+      - name: Upload Linux binaries and checksums
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: linux-release
+          path: |
             release/*.AppImage
             release/*.deb
             release/*.sha256
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          draft: true
+          if-no-files-found: error
 
   build-windows:
     needs: [resolve-version, verify-tests]
@@ -109,38 +128,98 @@ jobs:
         shell: pwsh
         run: .\build.ps1 -Version $env:VERSION
 
-      - name: Upload Setup installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-setup
-          path: release/*-Setup.exe
-          if-no-files-found: error
+      - name: Verify Setup and Portable carry ffmpeg and ffprobe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Assert-Ok([string]$what) {
+            if ($LASTEXITCODE -ne 0) { throw "$what failed (exit $LASTEXITCODE)" }
+          }
+          Get-ChildItem release | Format-Table Name, Length
+          $setup    = Join-Path $PWD "release\cove-compressor-$env:VERSION-Setup.exe"
+          $portable = Join-Path $PWD "release\cove-compressor-$env:VERSION-Portable.exe"
 
-      - name: Upload Portable exe
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-portable
-          path: release/*-Portable.exe
-          if-no-files-found: error
+          # Setup: install it for real into a scratch directory and look inside.
+          $installDir = Join-Path $env:RUNNER_TEMP 'cove-installed'
+          $installLog = Join-Path $env:RUNNER_TEMP 'cove-setup.log'
+          $proc = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER',
+            "/DIR=$installDir", "/LOG=$installLog")
+          if ($proc.ExitCode -ne 0) {
+            if (Test-Path $installLog) { Get-Content $installLog -Tail 40 }
+            throw "Setup exited $($proc.ExitCode)"
+          }
+          python scripts/release_verify.py tree $installDir --windows --run
+          Assert-Ok 'Setup contents'
+
+          # Portable: a one-file exe is a PyInstaller archive; list what it bundles.
+          python -m pip install --quiet pyinstaller
+          Assert-Ok 'pip install pyinstaller'
+          $listing = Join-Path $env:RUNNER_TEMP 'portable-listing.txt'
+          pyi-archive_viewer --list --recursive $portable | Out-File -Encoding utf8 $listing
+          Assert-Ok 'pyi-archive_viewer'
+          python scripts/release_verify.py listing $listing
+          Assert-Ok 'Portable contents'
 
       - name: Generate checksums
         shell: pwsh
         run: |
-          Get-ChildItem -Path release -File |
-            Where-Object { $_.Name -match '-(Setup|Portable)\.exe$' } |
-            ForEach-Object {
-              $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-              [System.IO.File]::WriteAllText("$($_.FullName).sha256", "$h  $($_.Name)`n")
-            }
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @("cove-compressor-$env:VERSION-Setup.exe", "cove-compressor-$env:VERSION-Portable.exe")) {
+            $path = Join-Path release $name
+            $h = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+            [System.IO.File]::WriteAllText("$((Resolve-Path release).Path)\$name.sha256", "$h  $name`n")
+          }
 
-      - name: Attach to GitHub Release
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
+      - name: Verify binaries and checksums
+        shell: pwsh
+        run: |
+          python scripts/release_verify.py assets release $env:VERSION --platform windows
+          if ($LASTEXITCODE -ne 0) { throw "asset verification failed" }
+
+      - name: Upload Windows binaries and checksums
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: windows-release
+          path: |
             release/*-Setup.exe
             release/*-Portable.exe
             release/*.sha256
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          draft: true
+          if-no-files-found: error
+
+  # The only job that can write to the repository. It runs only for a tag, only
+  # after the tests and both builds succeeded, and it can only leave a DRAFT.
+  release:
+    if: github.ref_type == 'tag'
+    needs: [resolve-version, verify-tests, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the build outputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-release'
+          merge-multiple: true
+          path: assets
+
+      - name: Verify all eight files
+        run: |
+          set -euo pipefail
+          ls -l assets
+          python3 scripts/release_verify.py assets assets "$VERSION"
+          (cd assets && sha256sum -c ./*.sha256)
+
+      - name: Create the draft release
+        run: |
+          python3 scripts/draft_release.py create "$GITHUB_REPOSITORY" "$TAG" "$VERSION" assets ".github/release-notes/v${VERSION}.md"
+
+      - name: Read the draft back
+        run: |
+          python3 scripts/draft_release.py check "$GITHUB_REPOSITORY" "$TAG" "$VERSION" assets

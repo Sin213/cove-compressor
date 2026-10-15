@@ -9,7 +9,7 @@
 #     it if absent)
 #
 # Env vars:
-#   VERSION=2.0.0    # artifact version
+#   VERSION=2.6.0    # artifact version
 #
 # Output lands in release/ alongside the Linux AppImage / .deb.
 set -euo pipefail
@@ -17,7 +17,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-VERSION="${VERSION:-2.0.0}"
+VERSION="${VERSION:-2.6.0}"
 APP="cove-compressor"
 RELEASE_DIR="$ROOT/release"
 mkdir -p "$RELEASE_DIR"
